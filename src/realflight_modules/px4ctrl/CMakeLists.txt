@@ -45,9 +45,12 @@ find_package(osqp 1.0 CONFIG REQUIRED)
 find_package(acados CONFIG REQUIRED)
 find_package(NLopt 2.7 CONFIG REQUIRED)
 
-find_path(IPOPT_INCLUDE_DIR NAMES IpIpoptApplication.hpp
+# Use project-specific cache names. Older builds cached IPOPT_INCLUDE_DIR and
+# IPOPT_LIBRARY under the removed 3rdpart/optimization tree; reusing those
+# generic names can silently preserve a dead path after dependency migration.
+find_path(PX4CTRL_IPOPT_INCLUDE_DIR NAMES IpIpoptApplication.hpp
   PATH_SUFFIXES coin-or coin REQUIRED)
-find_library(IPOPT_LIBRARY NAMES ipopt REQUIRED)
+find_library(PX4CTRL_IPOPT_LIBRARY NAMES ipopt REQUIRED)
 
 set(PX4CTRL_ACADOS_GENERATED
   "${CMAKE_CURRENT_SOURCE_DIR}/generated/acados/px4ctrl_nmpc")
@@ -58,7 +61,8 @@ find_library(UMFPACK_LIBRARY NAMES umfpack REQUIRED)
 
 message(STATUS "px4ctrl Eigen: Eigen3::Eigen")
 message(STATUS "px4ctrl OSQP: osqp::osqp")
-message(STATUS "px4ctrl Ipopt: ${IPOPT_LIBRARY}")
+message(STATUS "px4ctrl Ipopt include: ${PX4CTRL_IPOPT_INCLUDE_DIR}")
+message(STATUS "px4ctrl Ipopt library: ${PX4CTRL_IPOPT_LIBRARY}")
 message(STATUS "px4ctrl NLopt: NLopt::nlopt")
 message(STATUS "px4ctrl acados: acados")
 message(STATUS "px4ctrl UMFPACK: ${UMFPACK_LIBRARY}")
@@ -124,13 +128,13 @@ ament_target_dependencies(px4ctrl_node
   std_srvs
 )
 target_include_directories(px4ctrl_node SYSTEM PRIVATE
-  "${IPOPT_INCLUDE_DIR}")
+  "${PX4CTRL_IPOPT_INCLUDE_DIR}")
 target_include_directories(px4ctrl_node PRIVATE include)
 target_compile_definitions(px4ctrl_node PRIVATE HAVE_CSTDDEF)
 target_link_libraries(px4ctrl_node
   Eigen3::Eigen
   osqp::osqp
-  ${IPOPT_LIBRARY}
+  ${PX4CTRL_IPOPT_LIBRARY}
   NLopt::nlopt
   px4ctrl_casadi_nmpc_bridge
   px4ctrl_acados_ocp_solver

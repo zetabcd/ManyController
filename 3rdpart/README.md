@@ -45,6 +45,11 @@ src/realflight_modules/px4ctrl/generated/acados/px4ctrl_nmpc
 | BLASFEO | acados 锁定提交 | acados 线性代数 | 随 acados 安装 |
 | HPIPM | acados 锁定提交 | acados QP 求解 | 随 acados 安装 |
 
+OSQP 的上游 `v1.0.0` 源码在直接使用 CMake 构建时不会从 Git 标签自动推导版本，
+其 `OSQP_VERSION` 缓存变量默认值反而是 `0.0.0`。因此 `build_all.sh` 会显式传入
+`-DOSQP_VERSION=1.0.0`，保证安装出的 `osqp-config-version.cmake` 与实际源码版本
+一致，并能通过工程中的 `find_package(osqp 1.0 CONFIG REQUIRED)` 检查。
+
 Ipopt 还使用发行版提供的 BLAS、LAPACK、顺序版 MUMPS 和 Scotch。UMFPACK 由
 `px4ctrlrate_node` 直接使用。这些基础数值库仍作为系统包安装，不复制进仓库。
 ROS 2、PX4 消息及工作空间内的消息/工具包也仍由 ROS 环境和当前工作空间提供。
@@ -114,6 +119,15 @@ colcon build --packages-up-to px4ctrl --cmake-clean-cache \
 `/home/.../manycontroller/3rdpart/...`，必须使用 `--cmake-clean-cache` 或删除工作
 空间的 `build/px4ctrl` 后重新配置。
 
+工程使用项目专用的 `PX4CTRL_IPOPT_INCLUDE_DIR` 和
+`PX4CTRL_IPOPT_LIBRARY` 缓存变量，避免过去的通用 `IPOPT_INCLUDE_DIR`、
+`IPOPT_LIBRARY` 继续指向已经删除的 `3rdpart/optimization`。如果编译命令仍出现
+旧目录，说明整个 px4ctrl 配置缓存尚未清理，应执行：
+
+```bash
+colcon build --packages-up-to px4ctrl --cmake-clean-cache
+```
+
 ## 构建工作空间
 
 ```bash
@@ -145,6 +159,49 @@ JOBS=2 ./3rdpart/build_all.sh
 子模块记录的是精确提交，因此不会再出现 QDLDL 更新步骤把 `v0.1.8` 错当成
 `origin/v0.1.8` 分支进行 rebase 的问题。`build_all.sh` 还通过
 `FETCHCONTENT_SOURCE_DIR_QDLDL` 强制 OSQP 使用仓库中已锁定的 QDLDL 源码。
+
+## 修复已安装 OSQP 显示为 0.0.0
+
+如果 OSQP 是用旧版脚本安装的，CMake 可能报告：
+
+```text
+Could not find a configuration file for package "osqp" that is compatible
+with requested version "1.0".
+/usr/local/lib/cmake/osqp/osqp-config.cmake, version: 0.0.0
+```
+
+源码并没有错装：`3rdpart/src/osqp` 仍是 `v1.0.0`。这是上游 CMake 版本变量没有
+赋值造成的包元数据错误。更新本仓库后重新配置、编译和安装 OSQP 即可：
+
+```bash
+cmake -S 3rdpart/src/osqp -B 3rdpart/build/osqp \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/usr/local \
+  -DOSQP_VERSION=1.0.0 \
+  -DOSQP_BUILD_SHARED_LIB=ON \
+  -DOSQP_BUILD_STATIC_LIB=OFF \
+  -DOSQP_BUILD_UNITTESTS=OFF \
+  -DOSQP_BUILD_DEMO_EXE=OFF \
+  -DFETCHCONTENT_UPDATES_DISCONNECTED=ON \
+  -DFETCHCONTENT_SOURCE_DIR_QDLDL="$PWD/3rdpart/src/qdldl"
+cmake --build 3rdpart/build/osqp --parallel 2
+sudo cmake --install 3rdpart/build/osqp
+sudo ldconfig
+```
+
+确认安装元数据和工程查找均正常：
+
+```bash
+grep 'set(PACKAGE_VERSION' \
+  /usr/local/lib/cmake/osqp/osqp-config-version.cmake | head -1
+```
+
+第一条命令应该显示 `1.0.0`。之后清除 px4ctrl 的旧 CMake 缓存并重新构建：
+
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --packages-up-to px4ctrl --cmake-clean-cache
+```
 
 ## 可选：重新生成 acados 模型代码
 

@@ -1,0 +1,1212 @@
+%% third_party_dependency_management.tex
+%% many_controller 第三方数值库关系、构建、安装与 CMake 查找完整说明
+%% 编译方式: xelatex third_party_dependency_management.tex（建议执行两次生成目录）
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{enumitem,geometry,xcolor,hyperref}
+\usepackage{listings}
+\usepackage{fancyhdr}
+
+\geometry{left=21mm,right=21mm,top=22mm,bottom=24mm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  urlcolor=blue!55!black
+}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.3em}
+\setlength{\emergencystretch}{4em}
+\renewcommand{\arraystretch}{1.25}
+\setlist{leftmargin=2.2em}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\pathcode}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\yes}{\textcolor{green!45!black}{是}}
+\newcommand{\no}{\textcolor{red!65!black}{否}}
+\newcommand{\optional}{\textcolor{orange!70!black}{可选}}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  keywordstyle=\color{blue!65!black},
+  commentstyle=\color{gray!75!black},
+  stringstyle=\color{orange!60!black}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{many\_controller 第三方依赖管理}
+\fancyhead[R]{\thepage}
+\setlength{\headheight}{14pt}
+
+\title{\textbf{many\_controller 第三方数值库：依赖关系、源码组织、安装与 CMake 查找全解}}
+\author{对应当前工程的 \code{3rdpart/}、\code{px4ctrl/CMakeLists.txt} 与构建脚本}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{文档目的与结论先行}
+
+本文统一回答以下问题：
+\begin{enumerate}
+  \item 工程中哪些对象是库，哪些是独立程序或构建工具；
+  \item 静态库、共享库、纯头文件库、插件和普通源文件如何进入最终程序；
+  \item Coin-OR、Ipopt、CasADi、acados、OSQP 等项目之间到底是什么关系；
+  \item 哪些依赖来自顶层 Git 子模块，哪些来自嵌套子模块，哪些源码直接包含在上游仓库中，哪些来自操作系统；
+  \item 所有当前启用的原生数值库、Python 计算库及其完整依赖顺序；
+  \item 安装到 \code{/usr/local} 与安装到自定义目录时，CMake 应设置哪些变量；
+  \item 对不遵守标准 CMake 安装结构的库，应如何按其自身构建风格处理；
+  \item 如何在另一台计算机同步源码、重新编译、排查找不到头文件或共享库的问题。
+\end{enumerate}
+
+最重要的结论是：这些库并不是彼此双向耦合，而是组成一张\textbf{有向无环依赖图}。例如 OSQP 依赖 QDLDL，但 QDLDL 不依赖 OSQP；acados 依赖 HPIPM 和 BLASFEO，但它不依赖 Ipopt；CasADi 的 Ipopt 插件依赖 Ipopt，但 Ipopt 不依赖 CasADi。
+
+当前工程看起来“所有库都必须存在”，主要是因为 \code{px4ctrl_node} 同时编译了多个控制器后端，而不是因为这些求解器天然相互依赖。
+
+\section{首先区分：源码工程、库、插件、工具和独立程序}
+
+\subsection{库并不等于独立软件}
+
+一个上游 Git 仓库可能同时产生库、命令行程序、测试程序、插件和开发配置。因此，“这个项目是软件还是库”经常不是二选一。
+
+\begin{longtable}{p{0.17\linewidth}p{0.24\linewidth}p{0.27\linewidth}p{0.22\linewidth}}
+\toprule
+类型 & 常见产物 & 如何被工程使用 & 是否进入最终可执行文件 \\
+\midrule
+\endfirsthead
+\toprule
+类型 & 常见产物 & 如何被工程使用 & 是否进入最终可执行文件 \\
+\midrule
+\endhead
+纯头文件库 & \code{Eigen/*.h} & 编译器实例化模板 & 使用到的机器码直接进入目标 \\
+静态库 & \code{libfoo.a} & 链接阶段抽取目标文件 & 被使用的代码通常进入目标 \\
+共享库 & \code{libfoo.so} & 链接时记录依赖，运行时加载 & 代码通常不复制进目标 \\
+插件库 & \code{libcasadi_nlpsol_ipopt.so} & 主库按名称动态加载 & 作为独立共享对象运行 \\
+普通源码 & \code{model.c}、\code{solver.cpp} & \code{add_library}/\code{add_executable} & 直接编译进入对应目标 \\
+构建工具 & CMake、编译器、\code{t_renderer} & 构建时生成或转换文件 & 不进入运行时程序 \\
+独立程序 & demo、CLI、ROS 2 node & 由用户或系统直接执行 & 本身就是最终可执行文件 \\
+包配置 & \code{FooConfig.cmake}、\code{foo.pc} & 告诉构建系统头文件和库的位置 & 不含算法代码 \\
+\bottomrule
+\end{longtable}
+
+因此，“独立软件不可能被编译进另一个程序”只对\textbf{已经形成的可执行文件}成立。库、插件、普通源码和模板头文件都可以以不同方式参与另一个可执行文件的构建。
+
+\subsection{当前安装脚本产生什么}
+
+\code{3rdpart/build_all.sh} 主要安装开发库，而不是面向用户的独立应用：
+\begin{itemize}
+  \item Eigen：头文件和 CMake/package 配置；
+  \item OSQP、NLopt、Ipopt、CasADi、acados、HPIPM、BLASFEO：共享库、头文件和包配置；
+  \item QDLDL：作为 OSQP 的内部构建输入，不单独安装；
+  \item OSQP demo、NLopt Python/Matlab/Octave 绑定、Ipopt Java、acados examples：当前均关闭；
+  \item px4ctrl 专用 acados solver：由主工程从 C 源码编译成静态目标，不作为通用第三方库安装。
+\end{itemize}
+
+\section{第三方源码进入工程的六种方式}
+
+\subsection{方式一：操作系统开发包}
+
+发行版把头文件、共享库、静态库和元数据安装到标准位置，例如：
+\begin{lstlisting}
+/usr/include/
+/usr/include/suitesparse/
+/usr/lib/x86_64-linux-gnu/
+/usr/lib/x86_64-linux-gnu/pkgconfig/
+\end{lstlisting}
+
+当前系统来源的主要数值库为 BLAS、LAPACK、MUMPS sequential、Scotch、METIS 和 SuiteSparse/UMFPACK。它们由 \code{apt} 管理，不复制到仓库。
+
+\subsection{方式二：主仓库顶层 Git 子模块}
+
+主仓库只记录上游仓库 URL 和精确提交：
+\begin{lstlisting}
+3rdpart/src/eigen
+3rdpart/src/qdldl
+3rdpart/src/osqp
+3rdpart/src/nlopt
+3rdpart/src/ipopt
+3rdpart/src/casadi
+3rdpart/src/acados
+\end{lstlisting}
+
+这些目录在 Git 中是 mode \code{160000} 的 gitlink，而不是把几万个上游文件复制进主仓库历史。另一台机器必须执行 \code{git submodule update --init} 才会得到实际源码。
+
+\subsection{方式三：上游项目自己的嵌套 Git 子模块}
+
+acados 在自己的仓库中记录 HPIPM、BLASFEO 等外部项目。当前只初始化实际使用的两个：
+\begin{lstlisting}
+git -C 3rdpart/src/acados submodule update --init \
+  external/blasfeo external/hpipm
+\end{lstlisting}
+
+这表示主仓库固定 acados 提交，acados 提交再固定 HPIPM/BLASFEO 提交，形成两级版本锁定。
+
+\subsection{方式四：上游仓库直接包含第三方源码}
+
+CasADi 当前没有实际 Git 子模块，但其源码树中直接包含若干第三方源码快照，例如：
+\begin{lstlisting}
+casadi/external_packages/casadi-sundials
+casadi/external_packages/CSparse
+casadi/external_packages/tinyxml2-9.0.0
+casadi/external_packages/qpOASES
+\end{lstlisting}
+
+这种方式对 Git 来说只是 CasADi 仓库的普通文件。是否编译仍由 CasADi 的 CMake 选项决定；“源码存在”不等于“当前启用”。
+
+\subsection{方式五：配置阶段下载并构建}
+
+CasADi 可以通过 \code{WITH_BUILD_*} 选项让 CMake 的 \code{ExternalProject} 在构建目录中下载依赖；OSQP 也会通过 \code{FetchContent} 获取 QDLDL。优点是自动，缺点是：
+\begin{itemize}
+  \item 构建时依赖网络；
+  \item 下载源码通常留在临时 build 目录；
+  \item 更新步骤可能把标签误当成远端分支；
+  \item 版本、补丁和失败位置不够直观。
+\end{itemize}
+
+当前工程尽量避免这种隐式下载。OSQP 通过以下变量强制使用已经锁定的 QDLDL 源码：
+\begin{lstlisting}
+-DFETCHCONTENT_SOURCE_DIR_QDLDL=/path/to/3rdpart/src/qdldl
+-DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+\end{lstlisting}
+
+\subsection{方式六：项目自己的生成源码}
+
+acados Python 模板根据本项目动力学、代价和约束生成 C/H/JSON。这些文件属于 px4ctrl，而不是通用 acados 安装包：
+\begin{lstlisting}
+src/realflight_modules/px4ctrl/generated/acados/px4ctrl_nmpc
+\end{lstlisting}
+
+生成源码提交到 Git；\code{.o}、\code{.a}、\code{.so} 不提交。CMake 在每台机器上重新编译这些 C 文件。
+
+\section{Coin-OR、Ipopt 与 CasADi 的准确关系}
+
+\subsection{Coin-OR 是组织和生态，不是单个库}
+
+Coin-OR（Computational Infrastructure for Operations Research）包含许多独立项目：
+\begin{lstlisting}
+Coin-OR ecosystem
+|- Ipopt       nonlinear programming
+|- Clp         linear programming
+|- Cbc         mixed-integer programming
+|- Bonmin      mixed-integer nonlinear programming
+|- Cgl         cut generation
+|- CoinUtils   shared utilities
+`- ThirdParty-* build adapters for external packages
+\end{lstlisting}
+
+它们分别有独立仓库和库文件，例如 \code{libipopt.so}、\code{libCbc.so}、\code{libClp.so}。目录 \code{include/coin-or} 只是头文件安装约定，不表示存在名为“coin-or”的单体库。
+
+\subsection{Ipopt 自己包含什么}
+
+当前固定的 Ipopt 仓库没有 Git 子模块。它包含：
+\begin{itemize}
+  \item 内点法核心算法；
+  \item TNLP、C/C++ 接口；
+  \item 对 MUMPS、HSL、Pardiso、SPRAL 等线性求解器的适配代码；
+  \item Autotools 构建系统。
+\end{itemize}
+
+但是“包含某求解器的适配接口”不等于“包含该求解器的实现”。当前 MUMPS、BLAS 和 LAPACK 实现来自系统包：
+\begin{lstlisting}
+Ipopt source
+  -> Ipopt MUMPS adapter
+  -> system libdmumps_seq.so
+  -> system BLAS/LAPACK/Scotch/libgfortran
+\end{lstlisting}
+
+HSL、Pardiso 和 SPRAL 等后端当前没有启用。
+
+\subsection{CasADi 是符号框架加插件体系}
+
+CasADi 提供符号表达式、自动微分、函数图、代码生成和求解器统一接口。它不是 Ipopt 或 OSQP 本身，而是通过插件调用它们：
+\begin{lstlisting}
+CasADi core
+|- nlpsol_ipopt plugin -> Ipopt
+|- conic_osqp plugin   -> OSQP       (currently disabled)
+|- conic_qpoases       -> qpOASES    (currently disabled)
+|- linsol_csparse      -> CSparse
+`- integrator_sundials -> Sundials
+\end{lstlisting}
+
+当前构建明确设置：
+\begin{lstlisting}
+-DWITH_IPOPT=ON
+-DWITH_BUILD_IPOPT=OFF
+-DWITH_SELFCONTAINED=OFF
+-DWITH_PYTHON=OFF
+\end{lstlisting}
+
+含义是启用 CasADi 的 Ipopt 插件，但使用此前安装到目标前缀的 Ipopt，不让 CasADi 重新下载另一份 Ipopt。
+
+CasADi 3.7.2 默认还编译仓库内置 Sundials、CSparse 和 TinyXML。当前 px4ctrl 代码实际只调用：
+\begin{lstlisting}
+casadi::nlpsol("px4ctrl_casadi_nmpc", "ipopt", nlp, options)
+\end{lstlisting}
+
+因此 Sundials、CSparse、TinyXML 是由 CasADi 默认配置带入的组件，不是当前控制器算法的直接需要。后续可在完整测试后考虑关闭：
+\begin{lstlisting}
+-DWITH_SUNDIALS=OFF
+-DWITH_CSPARSE=OFF
+-DWITH_TINYXML=OFF
+\end{lstlisting}
+
+\section{acados 的内部关系}
+
+acados 是独立的实时最优控制框架。当前配置使用的求解链为：
+\begin{lstlisting}
+generated px4ctrl OCP solver
+  -> acados SQP / OCP-NLP interface
+  -> HPIPM partial-condensing QP solver
+  -> BLASFEO dense linear algebra kernels
+  -> libc / libm
+\end{lstlisting}
+
+acados、HPIPM、BLASFEO 的源码关系和安装产物为：
+\begin{longtable}{p{0.22\linewidth}p{0.28\linewidth}p{0.22\linewidth}p{0.18\linewidth}}
+\toprule
+项目 & 源码位置 & 安装产物 & 当前启用 \\
+\midrule
+acados & 顶层 Git 子模块 & \code{libacados.so} & \yes \\
+HPIPM & acados 内部子模块 & \code{libhpipm.so} & \yes \\
+BLASFEO & acados 内部子模块 & \code{libblasfeo.so} & \yes \\
+qpOASES/DAQP/OSQP 等 & acados 可选内部项目 & 对应插件或库 & \no \\
+\bottomrule
+\end{longtable}
+
+当前 ELF 运行时依赖关系为：
+\begin{lstlisting}
+libacados.so
+|- libhpipm.so
+|- libblasfeo.so
+|- libm.so
+`- libc.so
+
+libhpipm.so
+|- libblasfeo.so
+`- libc.so
+\end{lstlisting}
+
+\section{当前启用的完整原生数值依赖图}
+
+\subsection{从系统底层到最终节点}
+
+下面只列当前真正参与构建或运行的数值/计算库，不把上游源码中关闭的测试和插件误算为必需项：
+\begin{lstlisting}
+System foundation
+|- libc / libm / libstdc++ / pthread
+|- BLAS
+|- LAPACK -> BLAS
+|- Scotch
+|- METIS
+|- libgfortran
+`- SuiteSparseConfig
+
+System sparse solvers
+|- MUMPS sequential
+|  |- BLAS
+|  |- LAPACK
+|  |- Scotch
+|  `- libgfortran
+|
+`- SuiteSparse
+   |- AMD -> SuiteSparseConfig
+   |- COLAMD / CAMD / CCOLAMD
+   |- CHOLMOD
+   |  |- AMD/COLAMD/CAMD/CCOLAMD
+   |  |- METIS
+   |  |- BLAS/LAPACK
+   |  `- OpenMP runtime
+   `- UMFPACK
+      |- AMD
+      |- CHOLMOD
+      |- SuiteSparseConfig
+      `- BLAS
+
+Project source leaves
+|- Eigen (header-only)
+|- QDLDL
+|- NLopt
+`- BLASFEO
+
+Intermediate solvers
+|- OSQP -> QDLDL + libm
+|- HPIPM -> BLASFEO
+`- Ipopt -> MUMPS -> BLAS/LAPACK/Scotch
+
+Upper frameworks
+|- acados -> HPIPM -> BLASFEO
+`- CasADi -> Ipopt plugin -> Ipopt -> MUMPS
+
+Project generated code
+`- px4ctrl_acados_ocp_solver -> acados + HPIPM + BLASFEO
+
+Final executables
+|- px4ctrl_node
+|  |- Eigen
+|  |- OSQP -> QDLDL
+|  |- NLopt
+|  |- Ipopt -> MUMPS -> BLAS/LAPACK/Scotch
+|  |- CasADi -> Ipopt
+|  `- acados solver -> acados -> HPIPM -> BLASFEO
+|- gpttraj_visualizer_node -> Eigen + OSQP
+`- px4ctrlrate_node -> Eigen + UMFPACK -> SuiteSparse
+\end{lstlisting}
+
+\subsection{关键系统稀疏库的实际传递关系}
+
+在当前 Ubuntu 环境中，\code{libumfpack.so} 的动态依赖包含 \code{libamd}、\code{libcholmod}、\code{libsuitesparseconfig} 和 BLAS；\code{libcholmod.so} 又继续依赖 COLAMD、CAMD、CCOLAMD、METIS、LAPACK、BLAS 和 OpenMP runtime。因此只在主工程写 \code{-lumfpack}，不代表它在运行时只有一个库。
+
+正确做法是安装发行版的 \code{libsuitesparse-dev}，让包管理器维护这条传递链，而不是手工复制单个 \code{libumfpack.so}。
+
+\section{构建顺序：依赖图不是唯一线性队列}
+
+真正的约束是“依赖必须先于使用者完成”，独立分支可以并行。一个合法的拓扑顺序如下。
+
+\subsection{第 0 层：构建工具和系统库}
+
+\begin{lstlisting}
+gcc/g++/gfortran
+CMake + Make
+Autoconf + Automake + Libtool
+pkg-config
+BLAS + LAPACK
+MUMPS sequential + Scotch
+METIS
+SuiteSparse/UMFPACK
+\end{lstlisting}
+
+\subsection{第 1 层：叶子源码库}
+
+以下项目互相独立，可并行准备：
+\begin{lstlisting}
+Eigen
+QDLDL
+NLopt
+BLASFEO
+\end{lstlisting}
+
+\subsection{第 2 层：中间求解器}
+
+\begin{lstlisting}
+OSQP  <- QDLDL
+HPIPM <- BLASFEO
+Ipopt <- system MUMPS + BLAS/LAPACK
+\end{lstlisting}
+
+\subsection{第 3 层：上层框架}
+
+\begin{lstlisting}
+acados <- HPIPM + BLASFEO
+CasADi <- installed Ipopt
+\end{lstlisting}
+
+acados 和 CasADi 互不依赖，可以并行。当前脚本串行执行只是为了输出清晰和失败即停。
+
+\subsection{第 4--5 层：生成代码和 ROS 2 目标}
+
+\begin{lstlisting}
+px4ctrl generated acados C sources
+  -> px4ctrl_acados_ocp_solver static target
+  -> px4ctrl_node
+
+other branches
+  -> gpttraj_visualizer_node
+  -> px4ctrlrate_node
+\end{lstlisting}
+
+当前 \code{build_all.sh} 的线性执行顺序为：
+\begin{lstlisting}
+Eigen
+-> OSQP (uses local QDLDL)
+-> NLopt
+-> Ipopt
+-> CasADi
+-> acados (internally BLASFEO, then HPIPM)
+-> colcon build px4ctrl
+\end{lstlisting}
+
+\section{固定版本、源码和产物总表}
+
+\begin{longtable}{p{0.15\linewidth}p{0.16\linewidth}p{0.23\linewidth}p{0.25\linewidth}p{0.12\linewidth}}
+\toprule
+项目 & 固定版本 & 源码来源 & 主要安装产物 & 类型 \\
+\midrule
+\endfirsthead
+\toprule
+项目 & 固定版本 & 源码来源 & 主要安装产物 & 类型 \\
+\midrule
+\endhead
+Eigen & 3.4.0 & 顶层子模块 & \code{include/eigen3}、CMake config & 纯头文件 \\
+QDLDL & 0.1.8 & 顶层子模块 & 编译进 OSQP & C 源码/对象 \\
+OSQP & 1.0.0 & 顶层子模块 & \code{libosqp.so} & 共享库 \\
+NLopt & 2.7.1 & 顶层子模块 & \code{libnlopt.so} & 共享库 \\
+Ipopt & 3.14.11 & 顶层子模块 & \code{libipopt.so} & 共享库 \\
+CasADi & 3.7.2 & 顶层子模块 & \code{libcasadi.so}、插件 & 核心+插件库 \\
+acados & \code{4c23274e4} & 顶层子模块 & \code{libacados.so} & 共享库 \\
+HPIPM & acados 锁定 & acados 内部子模块 & \code{libhpipm.so} & 共享库 \\
+BLASFEO & acados 锁定 & acados 内部子模块 & \code{libblasfeo.so} & 共享库 \\
+MUMPS & 发行版版本 & 系统包 & \code{libdmumps_seq.so} 等 & 共享库 \\
+SuiteSparse & 发行版版本 & 系统包 & UMFPACK/CHOLMOD/AMD 等 & 库集合 \\
+px4ctrl solver & 工程生成版本 & 主工程普通源码 & 静态 CMake target & 项目专用 \\
+\bottomrule
+\end{longtable}
+
+\section{安装前缀：所谓“根目录”究竟是什么}
+
+\subsection{不要把安装前缀和文件系统根目录混淆}
+
+Linux 文件系统根目录是 \code{/}。普通源码安装不建议直接设置：
+\begin{lstlisting}
+-DCMAKE_INSTALL_PREFIX=/
+\end{lstlisting}
+
+因为这样会把文件直接散落到 \code{/include}、\code{/lib}、\code{/bin}，难以维护。通常所说“像普通安装一样装到系统里”，指的是安装到系统本地软件前缀：
+\begin{lstlisting}
+/usr/local
+|- include/
+|- lib/
+|- lib64/
+|- bin/
+|- share/
+`- cmake/ or lib/cmake/
+\end{lstlisting}
+
+\code{/usr/local} 本质上也是普通目录，只是编译器、CMake 和动态加载器通常默认认识它。
+
+\subsection{安装端变量：CMAKE\_INSTALL\_PREFIX}
+
+对标准 CMake 项目，安装位置在\textbf{编译第三方库时}设置：
+\begin{lstlisting}
+cmake -S source -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake --build build --parallel 2
+sudo cmake --install build
+\end{lstlisting}
+
+安装到自定义目录：
+\begin{lstlisting}
+cmake -S source -B build \
+  -DCMAKE_INSTALL_PREFIX=/opt/manycontroller-deps
+cmake --build build --parallel 2
+sudo cmake --install build
+\end{lstlisting}
+
+注意：\code{CMAKE_INSTALL_PREFIX} 回答的是“把当前正在编译的库安装到哪里”，不是“去哪里查找依赖”。
+
+\subsection{查找端变量：CMAKE\_PREFIX\_PATH}
+
+主工程需要查找已经安装的库时使用：
+\begin{lstlisting}
+colcon build --packages-up-to px4ctrl --cmake-clean-cache \
+  --cmake-args \
+  -DCMAKE_PREFIX_PATH=/opt/manycontroller-deps
+\end{lstlisting}
+
+多个前缀用 CMake 列表分隔：
+\begin{lstlisting}
+-DCMAKE_PREFIX_PATH="/opt/deps-a;/opt/deps-b"
+\end{lstlisting}
+
+两者关系可记为：
+\begin{equation}
+\boxed{
+\texttt{CMAKE\_INSTALL\_PREFIX}:\ \text{安装到哪里},\qquad
+\texttt{CMAKE\_PREFIX\_PATH}:\ \text{去哪里寻找}
+}
+\end{equation}
+
+\section{标准 CMake 包的推荐查找方式}
+
+\subsection{优先使用 find\_package 和导入目标}
+
+标准包安装后会提供 \code{FooConfig.cmake} 和导入目标：
+\begin{lstlisting}
+find_package(Eigen3 3.3 CONFIG REQUIRED)
+find_package(osqp 1.0 CONFIG REQUIRED)
+find_package(NLopt 2.7 CONFIG REQUIRED)
+find_package(casadi CONFIG REQUIRED)
+find_package(acados CONFIG REQUIRED)
+
+target_link_libraries(my_target PRIVATE
+  Eigen3::Eigen
+  osqp::osqp
+  NLopt::nlopt
+  casadi::casadi
+  acados
+)
+\end{lstlisting}
+
+导入目标不仅表示一个 \code{.so}，还携带：
+\begin{itemize}
+  \item 头文件目录；
+  \item 编译宏和编译选项；
+  \item 传递链接库；
+  \item Debug/Release 对应库；
+  \item 必要时的系统依赖。
+\end{itemize}
+
+因此应优先链接 \code{osqp::osqp}，而不是手工写 \code{-losqp}。
+
+\subsection{包级变量 Foo\_DIR}
+
+如果某个包的配置文件位置特殊，可以精确指定：
+\begin{lstlisting}
+-DEigen3_DIR=/opt/deps/share/eigen3/cmake
+-Dosqp_DIR=/opt/deps/lib/cmake/osqp
+-DNLopt_DIR=/opt/deps/lib/cmake/nlopt
+-Dcasadi_DIR=/opt/deps/lib/cmake/casadi
+-Dacados_DIR=/opt/deps/cmake
+\end{lstlisting}
+
+\code{Foo_DIR} 应指向\textbf{包含 FooConfig.cmake 的目录}，不是安装前缀，也不是共享库文件本身。
+
+包配置名称大小写由上游决定，例如当前 NLopt 使用 \code{NLoptConfig.cmake} 和 \code{NLopt::nlopt}。
+
+\subsection{不建议在项目内硬编码个人路径}
+
+不推荐：
+\begin{lstlisting}
+set(casadi_DIR "/home/manifold/project/3rdpart/casadi/cmake")
+\end{lstlisting}
+
+推荐由用户或工具链文件在配置时传入：
+\begin{lstlisting}
+cmake ... -DCMAKE_PREFIX_PATH=/opt/manycontroller-deps
+\end{lstlisting}
+
+这样同一份 CMakeLists 可以在不同用户名、架构和安装目录下复用。
+
+\section{没有标准包配置时的 CMake 处理}
+
+\subsection{find\_path 与 find\_library}
+
+Ipopt 和 UMFPACK 当前采用显式查找：
+\begin{lstlisting}
+find_path(IPOPT_INCLUDE_DIR
+  NAMES IpIpoptApplication.hpp
+  PATH_SUFFIXES coin-or coin
+  REQUIRED
+)
+find_library(IPOPT_LIBRARY NAMES ipopt REQUIRED)
+
+find_path(UMFPACK_INCLUDE_DIR
+  NAMES suitesparse/umfpack.h
+  REQUIRED
+)
+find_library(UMFPACK_LIBRARY NAMES umfpack REQUIRED)
+\end{lstlisting}
+
+自定义前缀可通过 \code{CMAKE_PREFIX_PATH} 影响这些命令，也可以提供项目自己的 cache 变量：
+\begin{lstlisting}
+set(IPOPT_ROOT "" CACHE PATH "Ipopt installation prefix")
+
+find_path(IPOPT_INCLUDE_DIR
+  NAMES IpIpoptApplication.hpp
+  HINTS "${IPOPT_ROOT}"
+  PATH_SUFFIXES include/coin-or include/coin
+  REQUIRED
+)
+
+find_library(IPOPT_LIBRARY
+  NAMES ipopt
+  HINTS "${IPOPT_ROOT}"
+  PATH_SUFFIXES lib lib64
+  REQUIRED
+)
+\end{lstlisting}
+
+用户调用：
+\begin{lstlisting}
+cmake ... -DIPOPT_ROOT=/opt/ipopt
+\end{lstlisting}
+
+\subsection{把手工结果封装为导入目标}
+
+为了保留现代 CMake 的传递关系，可以进一步封装：
+\begin{lstlisting}
+add_library(Ipopt::Ipopt UNKNOWN IMPORTED)
+set_target_properties(Ipopt::Ipopt PROPERTIES
+  IMPORTED_LOCATION "${IPOPT_LIBRARY}"
+  INTERFACE_INCLUDE_DIRECTORIES "${IPOPT_INCLUDE_DIR}"
+)
+
+target_link_libraries(my_target PRIVATE Ipopt::Ipopt)
+\end{lstlisting}
+
+实际项目若需要将 MUMPS 等传递库明确写入接口，也应加到 \code{INTERFACE_LINK_LIBRARIES}，而不是在所有可执行文件中重复。
+
+\subsection{CMAKE\_INCLUDE\_PATH 与 CMAKE\_LIBRARY\_PATH}
+
+它们是比 \code{CMAKE_PREFIX_PATH} 更低层的全局提示：
+\begin{lstlisting}
+-DCMAKE_INCLUDE_PATH=/opt/deps/include
+-DCMAKE_LIBRARY_PATH=/opt/deps/lib
+\end{lstlisting}
+
+适合没有规范安装结构的遗留库，但无法告诉 CMake 哪些头文件和库属于同一版本，也不能表达传递依赖。因此优先级应为：
+\begin{enumerate}
+  \item \code{CMAKE_PREFIX_PATH}；
+  \item 包级 \code{Foo_DIR}；
+  \item 项目定义的 \code{Foo_ROOT}；
+  \item 最后才是 \code{CMAKE_INCLUDE_PATH/CMAKE_LIBRARY_PATH}。
+\end{enumerate}
+
+\section{直接把源码纳入当前构建}
+
+\subsection{标准 CMake 子项目：add\_subdirectory}
+
+如果第三方项目支持作为子目录使用：
+\begin{lstlisting}
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+add_subdirectory(
+  "${THIRDPARTY_SOURCE_DIR}/foo"
+  "${CMAKE_BINARY_DIR}/third_party/foo"
+)
+target_link_libraries(my_target PRIVATE foo::foo)
+\end{lstlisting}
+
+风险包括 cache 选项冲突、目标重名、全局编译选项污染和安装规则混入主工程。因此大型项目如 Ipopt、CasADi、acados 更适合独立安装。
+
+\subsection{明确列出普通源文件：add\_library}
+
+项目生成代码适合直接编译：
+\begin{lstlisting}
+set(GENERATED_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/generated/acados/px4ctrl_nmpc"
+)
+
+add_library(px4ctrl_acados_ocp_solver STATIC
+  "${GENERATED_DIR}/acados_solver_px4ctrl_nmpc.c"
+  "${GENERATED_DIR}/px4ctrl_nmpc_model/model.c"
+  "${GENERATED_DIR}/px4ctrl_nmpc_cost/cost.c"
+)
+
+target_include_directories(px4ctrl_acados_ocp_solver PUBLIC
+  "${GENERATED_DIR}"
+)
+
+target_link_libraries(px4ctrl_acados_ocp_solver PUBLIC
+  acados hpipm blasfeo m
+)
+\end{lstlisting}
+
+这里 \code{find_package} 负责找到已经安装的 acados；\code{add_library} 负责真正编译项目生成的 C 文件。两者职责不同。
+
+\subsection{构建时需要独立工具：find\_program 与 custom command}
+
+如果需要代码生成器，不应把可执行文件传给 \code{target_link_libraries}，而应：
+\begin{lstlisting}
+find_program(T_RENDERER_EXECUTABLE NAMES t_renderer REQUIRED)
+
+add_custom_command(
+  OUTPUT generated_solver.c
+  COMMAND "${T_RENDERER_EXECUTABLE}" template.in generated_solver.c
+  DEPENDS template.in
+  VERBATIM
+)
+\end{lstlisting}
+
+这清楚地区分了“构建时运行的工具”和“运行时链接的库”。
+
+\section{特殊项目必须按各自风格处理}
+
+\subsection{Ipopt：Autotools 加系统 MUMPS}
+
+Ipopt 不是标准 CMake 子项目。当前流程是：
+\begin{lstlisting}
+mkdir -p build/ipopt
+cd build/ipopt
+/path/to/ipopt/configure \
+  --prefix=/usr/local \
+  --disable-java \
+  "--with-mumps-cflags=-I/usr/include -I/usr/include/mumps_seq" \
+  --with-mumps-lflags=-ldmumps_seq \
+  "--with-lapack-lflags=-llapack -lblas"
+make -j2
+sudo make install
+\end{lstlisting}
+
+Ubuntu 的 sequential MUMPS 头文件同时分布在 \code{/usr/include} 和 \code{/usr/include/mumps_seq}。遗漏后者会导致 MPI stub 头文件找不到；没有安装 \code{libmumps-seq-dev} 会出现 \code{mumps_compat.h}、\code{dmumps_c.h} 等缺失。
+
+\subsection{OSQP：固定本地 QDLDL}
+
+OSQP 1.0 的 builtin algebra backend 使用 QDLDL。当前不让 FetchContent 自己更新远端：
+\begin{lstlisting}
+cmake -S 3rdpart/src/osqp -B 3rdpart/build/osqp \
+  -DCMAKE_INSTALL_PREFIX=/usr/local \
+  -DOSQP_BUILD_SHARED_LIB=ON \
+  -DOSQP_BUILD_STATIC_LIB=OFF \
+  -DFETCHCONTENT_UPDATES_DISCONNECTED=ON \
+  -DFETCHCONTENT_SOURCE_DIR_QDLDL="$PWD/3rdpart/src/qdldl"
+\end{lstlisting}
+
+这样不会再发生更新脚本尝试对不存在的 \code{origin/v0.1.8} 分支 rebase。
+
+\subsection{acados：嵌套源码和双重安装变量}
+
+acados 构建前必须初始化 HPIPM/BLASFEO。当前配置：
+\begin{lstlisting}
+cmake -S 3rdpart/src/acados -B 3rdpart/build/acados \
+  -DCMAKE_INSTALL_PREFIX=/usr/local \
+  -DACADOS_INSTALL_DIR=/usr/local \
+  -DBUILD_SHARED_LIBS=ON \
+  -DBLASFEO_TARGET=GENERIC \
+  -DHPIPM_TARGET=GENERIC \
+  -DACADOS_EXAMPLES=OFF \
+  -DACADOS_UNIT_TESTS=OFF
+\end{lstlisting}
+
+acados 自己支持 \code{ACADOS_INSTALL_DIR}，所以脚本同时传递它和标准 \code{CMAKE_INSTALL_PREFIX}，避免上游逻辑覆盖安装位置。
+
+\code{BLASFEO_TARGET=GENERIC} 优先保证不同 CPU 可用。确认目标机具体 ARM 微架构后，可改成上游支持的优化 target，但不能把另一台 x86\_64 机器编译出的 BLASFEO 直接复制到 ARM 无人机。
+
+\subsection{CasADi：插件选项决定真实依赖}
+
+CasADi 可选项很多。当前关键原则是：
+\begin{lstlisting}
+WITH_IPOPT=ON          # build CasADi's Ipopt interface
+WITH_BUILD_IPOPT=OFF  # find the already installed Ipopt
+WITH_SELFCONTAINED=OFF
+WITH_PYTHON=OFF
+\end{lstlisting}
+
+如果启用 \code{WITH_BUILD_IPOPT=ON}，CasADi 会再下载、编译一套 Ipopt，可能产生重复版本。self-contained 模式还可能把众多插件及其依赖复制到同一安装目录，适合发布包，但不适合本工程追踪每条系统依赖。
+
+\subsection{Eigen：只有头文件，不应寻找 libEigen.so}
+
+正确方式：
+\begin{lstlisting}
+find_package(Eigen3 CONFIG REQUIRED)
+target_link_libraries(my_target PRIVATE Eigen3::Eigen)
+\end{lstlisting}
+
+这里的“link”主要传播 include 目录和编译要求。找不到 \code{Eigen/Eigen} 通常意味着 Eigen 未安装或 include 根目录没有指向 \code{.../include/eigen3}。
+
+\subsection{NLopt：上游库名与发行版拆包可能不同}
+
+NLopt 2.7.1 上游 CMake 安装 \code{libnlopt.so} 并导出 \code{NLopt::nlopt}。某些 Debian 包另有 \code{libnlopt_cxx.so}，但不能把发行版拆包布局硬编码成上游源码安装规则。当前使用：
+\begin{lstlisting}
+find_package(NLopt 2.7 CONFIG REQUIRED)
+target_link_libraries(my_target PRIVATE NLopt::nlopt)
+\end{lstlisting}
+
+\subsection{SuiteSparse：使用发行版传递依赖}
+
+UMFPACK 实际依赖 AMD、CHOLMOD、SuiteSparseConfig 和 BLAS，CHOLMOD 又依赖 METIS 等组件。应安装完整开发包：
+\begin{lstlisting}
+sudo apt install libsuitesparse-dev
+\end{lstlisting}
+
+不应从另一台机器只复制 \code{libumfpack.so}，否则非常容易缺少同版本 SONAME 和传递库。
+
+\section{自定义前缀的完整示例}
+
+\subsection{统一安装到单独目录}
+
+假设使用：
+\begin{lstlisting}
+/opt/manycontroller-deps
+\end{lstlisting}
+
+运行统一脚本：
+\begin{lstlisting}
+PREFIX=/opt/manycontroller-deps JOBS=2 ./3rdpart/build_all.sh
+\end{lstlisting}
+
+构建 px4ctrl：
+\begin{lstlisting}
+source /opt/ros/humble/setup.bash
+colcon build --packages-up-to px4ctrl --cmake-clean-cache \
+  --cmake-args \
+  -DCMAKE_PREFIX_PATH=/opt/manycontroller-deps
+\end{lstlisting}
+
+如果某个包配置位置仍不标准，可以补充：
+\begin{lstlisting}
+--cmake-args \
+  -DCMAKE_PREFIX_PATH=/opt/manycontroller-deps \
+  -Dacados_DIR=/opt/manycontroller-deps/cmake \
+  -Dosqp_DIR=/opt/manycontroller-deps/lib/cmake/osqp
+\end{lstlisting}
+
+\subsection{运行时共享库搜索}
+
+CMake 找到库只解决编译/链接阶段，Linux 动态加载器还必须在运行时找到 \code{.so}。
+
+临时方法：
+\begin{lstlisting}
+export LD_LIBRARY_PATH=/opt/manycontroller-deps/lib:$LD_LIBRARY_PATH
+\end{lstlisting}
+
+系统级方法：
+\begin{lstlisting}
+echo /opt/manycontroller-deps/lib | \
+  sudo tee /etc/ld.so.conf.d/manycontroller-deps.conf
+sudo ldconfig
+\end{lstlisting}
+
+也可以为目标设置 RPATH，但不建议写死个人主目录。发布到固定设备路径时可使用：
+\begin{lstlisting}
+set_target_properties(my_target PROPERTIES
+  INSTALL_RPATH "/opt/manycontroller-deps/lib"
+)
+\end{lstlisting}
+
+\subsection{工具链文件统一管理前缀}
+
+需要多台无人机或交叉编译时，可以创建项目工具链/初始缓存文件：
+\begin{lstlisting}
+# manycontroller-deps.cmake
+list(PREPEND CMAKE_PREFIX_PATH "/opt/manycontroller-deps")
+set(acados_DIR "/opt/manycontroller-deps/cmake" CACHE PATH "")
+\end{lstlisting}
+
+调用：
+\begin{lstlisting}
+colcon build ... --cmake-args \
+  -C /path/to/manycontroller-deps.cmake
+\end{lstlisting}
+
+交叉编译时还需要 \code{CMAKE_SYSROOT}、\code{CMAKE_FIND_ROOT_PATH} 和交叉编译器设置；不能把主机编译的共享库当作目标机库。
+
+\section{当前 CMake 目标与后端耦合}
+
+\subsection{三个最终节点}
+
+当前数值链接关系为：
+\begin{longtable}{p{0.25\linewidth}p{0.62\linewidth}}
+\toprule
+目标 & 直接数值依赖 \\
+\midrule
+\code{px4ctrl_node} & Eigen、OSQP、NLopt、Ipopt、CasADi bridge、项目 acados solver \\
+\code{gpttraj_visualizer_node} & Eigen、OSQP \\
+\code{px4ctrlrate_node} & Eigen、UMFPACK \\
+\bottomrule
+\end{longtable}
+
+\subsection{为什么只运行 acados 仍要安装 Ipopt/NLopt/CasADi}
+
+控制器在源码中通过编译期宏选择，但 \code{px4ctrl_node} 的 source list 当前仍包含：
+\begin{lstlisting}
+solver_nmpc_ipopt_eigen.cpp
+solver_nmpc_nlopt_eigen.cpp
+solver_nmpc_casadi.cpp
+solver_nmpc_acados.cpp
+\end{lstlisting}
+
+链接列表也包含所有后端。因此配置和链接阶段要求全部依赖存在。更好的后续结构是：
+\begin{lstlisting}
+option(PX4CTRL_WITH_IPOPT "Build Ipopt backend" ON)
+option(PX4CTRL_WITH_NLOPT "Build NLopt backend" ON)
+option(PX4CTRL_WITH_CASADI "Build CasADi backend" ON)
+option(PX4CTRL_WITH_ACADOS "Build acados backend" ON)
+\end{lstlisting}
+
+然后按选项条件性执行 \code{find_package}、添加源文件和链接库。这样如果无人机只需要 acados，可避免安装 Ipopt、MUMPS、NLopt 和 CasADi。这是解除\textbf{工程构建耦合}，不是修改求解器内部依赖。
+
+\section{Python 计算、代码生成和仿真依赖}
+
+\subsection{MuJoCo 仿真节点}
+
+\code{quadsim_mujoco} 使用：
+\begin{lstlisting}
+quadsim_mujoco
+|- NumPy
+|- SciPy
+|  |- scipy.integrate.solve_ivp
+|  `- scipy.spatial.transform.Rotation
+|- MuJoCo physics engine
+|- GLFW window/OpenGL context
+|- cv_bridge -> OpenCV
+`- ROS 2 Python rclpy
+\end{lstlisting}
+
+这些依赖目前没有完整写进该 Python 包的 \code{install_requires}；\code{setup.py} 只声明了 setuptools。因此迁移仿真环境时需要单独维护 Python requirements 或 rosdep 规则。
+
+\subsection{噪声分析脚本}
+
+\code{script/noise_analys.py} 使用 NumPy、SciPy optimize/sparse/interpolate、Pandas、Matplotlib 和 scikit-learn。它们属于离线分析环境，不是飞控节点的 C++ 运行时依赖。
+
+\subsection{acados 重新生成环境}
+
+\code{generate_px4ctrl_acados_nmpc.py} 需要 Python CasADi、NumPy 和 \code{acados_template}；后者还依赖 SciPy、Matplotlib、Cython、Deprecated 等 Python 包。它们只在改变模型、代价或约束后重新生成 C 代码时使用。
+
+已提交的 C 代码可以直接由 CMake 编译，因此正常编译 px4ctrl 不需要 Python CasADi 或 acados\_template。
+
+\section{存在于源码但当前没有启用的计算库}
+
+\subsection{CasADi 可选生态}
+
+CasADi 支持但当前关闭的开源后端包括：
+\begin{lstlisting}
+OSQP, qpOASES, HPIPM, BLASFEO, Fatrop, SuperSCS,
+Clarabel, ProxQP, DSDP, Bonmin, CBC, CLP, HiGHS,
+DAQP, SLEQP, Alpaqa, HSL, SPRAL, OOQP, SQIC, SLICOT
+\end{lstlisting}
+
+还包含 CPLEX、Gurobi、Knitro、WORHP、SNOPT 等商业或外部接口。源码中有 \code{FindXXX.cmake} 或 \code{WITH_XXX} 选项，不代表当前机器必须安装它们。
+
+\subsection{acados 可选后端}
+
+当前关闭：
+\begin{lstlisting}
+qpOASES, DAQP, HPMPC, QORE, OOQP,
+qpDUNES, OSQP, Clarabel, OpenMP
+\end{lstlisting}
+
+\subsection{Eigen 测试中出现的库}
+
+Eigen 的 tests/benchmarks 会探测 CHOLMOD、UMFPACK、KLU、SuperLU、PaStiX、SPQR、FFTW、CUDA、HIP、Boost 等。当前以 \code{BUILD_TESTING=OFF} 安装 Eigen 头文件，所以这些探测项不是 Eigen 的实际运行依赖。
+
+一般判断规则为：
+\begin{equation}
+\boxed{
+\text{源码中出现库名}\not\Rightarrow\text{当前构建启用该库}
+}
+\end{equation}
+
+应同时检查 CMake cache、构建选项、最终链接命令和 ELF \code{NEEDED} 项。
+
+\section{常见错误的根因与处理}
+
+\subsection{导入目标引用不存在的绝对路径}
+
+错误示例：
+\begin{lstlisting}
+The imported target "casadi::casadi" references
+/home/.../3rdpart/casadi/libcasadi.so.3.7
+but this file does not exist.
+\end{lstlisting}
+
+原因通常是复制了旧安装目录或 CMake cache，其中包配置记录了另一台机器的绝对路径。处理：
+\begin{enumerate}
+  \item 在目标机重新源码编译并安装；
+  \item 删除旧 CMake cache；
+  \item 使用 \code{--cmake-clean-cache}；
+  \item 检查 \code{casadi_DIR} 和 \code{CMAKE_PREFIX_PATH}。
+\end{enumerate}
+
+\subsection{QDLDL 更新步骤 rebase 失败}
+
+\begin{lstlisting}
+fatal: invalid upstream 'origin/v0.1.8'
+Failed to rebase in qdldl-src
+\end{lstlisting}
+
+标签 \code{v0.1.8} 被更新脚本误当成远端分支。当前通过固定 QDLDL 子模块、设置 \code{FETCHCONTENT_SOURCE_DIR_QDLDL} 和禁止更新解决。
+
+\subsection{Eigen/Eigen 找不到}
+
+\begin{lstlisting}
+fatal error: Eigen/Eigen: No such file or directory
+\end{lstlisting}
+
+Eigen 的典型布局是 \code{PREFIX/include/eigen3/Eigen}。使用 \code{Eigen3::Eigen} 可以自动传播正确 include 根目录；不要只把 \code{PREFIX/include} 当成 Eigen include 目录。
+
+\subsection{qpOASES.hpp 找不到}
+
+CasADi 的 qpOASES 插件或插件共享库不等于系统安装了 qpOASES C++ 开发头文件。当前 px4ctrl 不调用 qpOASES API，历史遗留 include 已删除，所以不应为此额外安装 qpOASES。
+
+\subsection{GLIBC 符号版本不匹配}
+
+\begin{lstlisting}
+undefined reference to pthread_join@GLIBC_2.34
+undefined reference to fstat@GLIBC_2.33
+\end{lstlisting}
+
+这说明复制来的共享库在更新的 glibc 上编译。添加 \code{-pthread} 或 include 路径不能修复 ABI 版本不匹配；必须在目标机原生编译，或使用兼容 sysroot/容器构建。
+
+\subsection{编译能找到，运行时找不到}
+
+\begin{lstlisting}
+error while loading shared libraries: libacados.so: cannot open...
+\end{lstlisting}
+
+检查：
+\begin{lstlisting}
+ldconfig -p | grep acados
+ldd /path/to/px4ctrl_node
+readelf -d /path/to/px4ctrl_node | grep NEEDED
+\end{lstlisting}
+
+标准 \code{/usr/local/lib} 安装后执行 \code{sudo ldconfig}；自定义目录则配置 ld.so、\code{LD_LIBRARY_PATH} 或合适 RPATH。
+
+\section{新机器从零构建流程}
+
+\subsection{安装系统依赖}
+
+\begin{lstlisting}
+sudo apt update
+sudo apt install -y \
+  build-essential cmake pkg-config autoconf automake libtool \
+  gfortran libblas-dev liblapack-dev libmumps-seq-dev \
+  libscotch-dev libmetis-dev libsuitesparse-dev \
+  python3-colcon-common-extensions
+\end{lstlisting}
+
+\subsection{同步固定源码}
+
+\begin{lstlisting}
+git pull --ff-only
+git submodule sync --recursive
+git submodule update --init
+git -C 3rdpart/src/acados submodule update --init \
+  external/blasfeo external/hpipm
+\end{lstlisting}
+
+不建议直接使用顶层 \code{--recursive} 初始化 acados 的所有可选子模块，因为会下载当前没有启用的 qpOASES、OSQP、DAQP、Clarabel 等项目。
+
+\subsection{安装到 /usr/local}
+
+无人机内存有限时降低并行数：
+\begin{lstlisting}
+JOBS=2 ./3rdpart/build_all.sh
+\end{lstlisting}
+
+\subsection{编译工作空间}
+
+\begin{lstlisting}
+source /opt/ros/humble/setup.bash
+colcon build --packages-up-to px4ctrl --cmake-clean-cache
+\end{lstlisting}
+
+\section{验证依赖是否正确}
+
+\subsection{确认子模块提交}
+
+\begin{lstlisting}
+git submodule status
+git -C 3rdpart/src/acados submodule status \
+  external/blasfeo external/hpipm
+\end{lstlisting}
+
+状态行前应为空格；\code{-} 表示未初始化，\code{+} 表示工作区提交与主仓库记录不一致。
+
+\subsection{确认 CMake 包配置}
+
+\begin{lstlisting}
+find /usr/local -type f \
+  \( -name '*Config.cmake' -o -name '*-config.cmake' \) \
+  | grep -E 'Eigen|osqp|NLopt|casadi|acados|hpipm|blasfeo'
+\end{lstlisting}
+
+\subsection{确认头文件和共享库}
+
+\begin{lstlisting}
+find /usr/local/include -maxdepth 4 \
+  \( -name Eigen -o -name osqp.h \
+     -o -name IpIpoptApplication.hpp \
+     -o -name ocp_nlp_interface.h \)
+
+ldconfig -p | grep -E \
+  'casadi|acados|hpipm|blasfeo|osqp|ipopt|nlopt|umfpack'
+\end{lstlisting}
+
+\subsection{确认最终程序没有引用仓库旧二进制}
+
+\begin{lstlisting}
+ldd install/px4ctrl/lib/px4ctrl/px4ctrl_node
+readelf -d install/px4ctrl/lib/px4ctrl/px4ctrl_node \
+  | grep -E 'NEEDED|RPATH|RUNPATH'
+\end{lstlisting}
+
+输出不应再出现 \code{/home/.../3rdpart/casadi}、\code{3rdpart/optimization} 或其他机器的绝对路径。
+
+\section{推荐的长期工程结构}
+
+\subsection{保持源码、构建结果和安装结果分离}
+
+\begin{lstlisting}
+repository/
+|- 3rdpart/src/       fixed upstream source checkouts
+|- 3rdpart/build/     local build trees, ignored by Git
+|- src/.../generated/ project-owned generated source
+`- /usr/local         installed libraries outside repository
+\end{lstlisting}
+
+自定义前缀时：
+\begin{lstlisting}
+repository/           source only
+/opt/manycontroller-deps/  installed headers/libs/configs
+\end{lstlisting}
+
+不要重新把安装后的 \code{include/}、\code{lib/*.so}、\code{share/doc} 作为普通文件提交到 \code{3rdpart}。
+
+\subsection{每个依赖明确记录四个信息}
+
+建议对每个第三方项目记录：
+\begin{enumerate}
+  \item 来源 URL 和固定 commit/tag；
+  \item 构建系统及关键选项；
+  \item 安装前缀和提供的 CMake target；
+  \item 直接依赖、传递依赖和运行时加载方式。
+\end{enumerate}
+
+\subsection{将后端按需编译}
+
+长期建议拆分 px4ctrl 的求解器后端。只启用 acados 时，原生依赖可以缩小为：
+\begin{lstlisting}
+Eigen
+OSQP              # still needed by gptmpc/gpttraj if those sources remain
+acados
+HPIPM
+BLASFEO
+SuiteSparse/UMFPACK
+\end{lstlisting}
+
+如果同时禁用 GptMpc/GptTraj 和 rate controller 中相关功能，还能进一步减少 OSQP 或 SuiteSparse；但必须按实际目标 source list 和运行功能决定，不能仅凭控制器运行时宏删除依赖。
+
+\section{变量速查表}
+
+\begin{longtable}{p{0.29\linewidth}p{0.28\linewidth}p{0.33\linewidth}}
+\toprule
+变量/命令 & 作用 & 示例 \\
+\midrule
+\endfirsthead
+\toprule
+变量/命令 & 作用 & 示例 \\
+\midrule
+\endhead
+\code{CMAKE_INSTALL_PREFIX} & 当前库安装到哪里 & \code{/usr/local}、\code{/opt/deps} \\
+\code{CMAKE_PREFIX_PATH} & 主工程去哪些前缀找包 & \code{/opt/deps-a;/opt/deps-b} \\
+\code{Foo_DIR} & 精确指定 \code{FooConfig.cmake} 目录 & \code{osqp_DIR=/opt/deps/lib/cmake/osqp} \\
+\code{Foo_ROOT} & 项目自定义的某库前缀提示 & \code{IPOPT_ROOT=/opt/ipopt} \\
+\code{CMAKE_INCLUDE_PATH} & 为 \code{find_path} 增加全局头文件目录 & \code{/opt/legacy/include} \\
+\code{CMAKE_LIBRARY_PATH} & 为 \code{find_library} 增加全局库目录 & \code{/opt/legacy/lib} \\
+\code{FETCHCONTENT_SOURCE_DIR_QDLDL} & OSQP 使用本地 QDLDL 源码 & \code{3rdpart/src/qdldl} \\
+\code{ACADOS_INSTALL_DIR} & acados 上游专用安装变量 & 通常等于安装前缀 \\
+\code{BLASFEO_TARGET} & BLASFEO CPU kernel 目标 & \code{GENERIC} 或上游架构值 \\
+\code{LD_LIBRARY_PATH} & 临时运行时共享库搜索路径 & \code{/opt/deps/lib} \\
+\code{INSTALL_RPATH} & 把运行时库路径写入目标 & 固定部署目录时使用 \\
+\code{PKG_CONFIG_PATH} & pkg-config 查找额外前缀 & \code{/opt/deps/lib/pkgconfig} \\
+\code{--cmake-clean-cache} & 丢弃旧绝对路径和查找结果 & 迁移机器后必须使用 \\
+\bottomrule
+\end{longtable}
+
+\section{最终原则}
+
+本工程的第三方依赖管理可以归纳为以下规则：
+\begin{enumerate}
+  \item 标准安装包使用 \code{find_package} 和导入 target；
+  \item 没有包配置的遗留库使用 \code{find_path/find_library}，最好再封装为导入 target；
+  \item 项目自己的生成源码使用 \code{add_library}，不提交生成二进制；
+  \item 构建期工具使用 \code{find_program/add_custom_command}，不能当库链接；
+  \item 大型或特殊构建系统按上游风格独立编译安装；
+  \item Git 子模块只负责固定源码版本，不等于已经安装；
+  \item \code{CMAKE_INSTALL_PREFIX} 管安装位置，\code{CMAKE_PREFIX_PATH} 管查找位置；
+  \item \code{/usr/local} 只是系统默认认识的标准前缀，自定义目录同样可行；
+  \item 源码中出现可选库不代表当前启用，必须看构建选项和最终 ELF 依赖；
+  \item 不同 CPU、glibc 和 C++ ABI 的机器应从源码重新构建，不能依赖复制来的共享库。
+\end{enumerate}
+
+\end{document}
