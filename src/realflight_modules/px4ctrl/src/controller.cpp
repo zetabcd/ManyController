@@ -4,7 +4,6 @@
 #include <iostream>
 #include <px4ctrl/controller.h>
 #include <px4ctrl/px4ctrl_node.h>
-#include <qpOASES.hpp>
 #include <uav_utils/geometry_utils.h>
 #include <uav_utils/other_utils.h>
 #include <px4ctrl/px4ctrlparam.h>
@@ -351,7 +350,7 @@ QuadControl::computeDesiredCollectiveThrustSignal(const double &thrust_des, cons
     double thrust(0.0);
     
     /* compute throttle, thr2acc has been estimated before */
-    if (thr2acc_ >= 0 && isfinite(thr2acc_))
+    if (thr2acc_ >= 0 && std::isfinite(thr2acc_))
     {
         thrust = acc_z_des / thr2acc_;
     }else{

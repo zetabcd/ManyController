@@ -2,6 +2,7 @@
 /build/
 /install/
 /log/
+/3rdpart/build/
 
 # Runtime and simulation output
 /sim_log/

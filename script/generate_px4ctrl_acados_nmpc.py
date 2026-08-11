@@ -135,16 +135,32 @@ def build_ocp(output_directory: Path) -> AcadosOcp:
 
 
 def main() -> None:
-    """Generate and compile the solver below 3rdpart/acados/generated/."""
+    """Regenerate the project-owned solver against an installed acados."""
     repository = Path(__file__).resolve().parents[1]
-    output_directory = repository / "3rdpart" / "acados" / "generated" / MODEL_NAME
+    output_directory = (
+        repository
+        / "src"
+        / "realflight_modules"
+        / "px4ctrl"
+        / "generated"
+        / "acados"
+        / MODEL_NAME
+    )
     output_directory.mkdir(parents=True, exist_ok=True)
-    acados_root = Path(os.environ.get("ACADOS_SOURCE_DIR", repository / "3rdpart" / "acados"))
-    if not (acados_root / "lib" / "libacados.so").exists():
-        raise FileNotFoundError(f"missing {acados_root}/lib/libacados.so")
-    os.environ["ACADOS_SOURCE_DIR"] = str(acados_root)
+    acados_source = Path(
+        os.environ.get("ACADOS_SOURCE_DIR", repository / "3rdpart" / "src" / "acados")
+    )
+    install_prefix = Path(os.environ.get("ACADOS_INSTALL_PREFIX", "/usr/local"))
+    acados_library = install_prefix / "lib" / "libacados.so"
+    if not acados_library.exists():
+        raise FileNotFoundError(f"missing {acados_library}; run 3rdpart/build_all.sh first")
+    if not (acados_source / "interfaces" / "acados_template").is_dir():
+        raise FileNotFoundError(f"missing acados source tree: {acados_source}")
+    os.environ["ACADOS_SOURCE_DIR"] = str(acados_source)
     json_file = output_directory / f"{MODEL_NAME}_ocp.json"
     ocp = build_ocp(output_directory)
+    ocp.code_gen_options.acados_include_path = str(install_prefix / "include")
+    ocp.code_gen_options.acados_lib_path = str(install_prefix / "lib")
     AcadosOcpSolver.generate(ocp, json_file=str(json_file), verbose=True)
     AcadosOcpSolver.build(str(output_directory), with_cython=False, verbose=True)
 

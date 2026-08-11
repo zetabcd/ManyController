@@ -431,7 +431,7 @@ MPC 输出质量归一化推力加速度 $a_T$，最终乘以质量换算为牛�
 
 \subsection{后端 3：acados（当前默认）}
 
-源码：\texttt{solver\_nmpc\_acados.cpp}，配合 \texttt{3rdpart/acados/generated/px4ctrl\_nmpc/} 中脚本 \texttt{generate\_px4ctrl\_acados\_nmpc.py} 自动生成的 C 代码。
+源码：\texttt{solver\_nmpc\_acados.cpp}，配合 \texttt{src/realflight\_modules/px4ctrl/generated/acados/px4ctrl\_nmpc/} 中由 \texttt{script/generate\_px4ctrl\_acados\_nmpc.py} 自动生成的 C 代码。
 
 \begin{itemize}
   \item 求解算法：实时迭代 SQP（RTI），QP 子问题用 HPIPM（内点法）+ BLASFEO 高性能线性代数；

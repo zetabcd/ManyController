@@ -36,54 +36,59 @@ find_package(joy_msgs REQUIRED)
 find_package(ratectrl_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
-# All nonlinear-solver dependencies are self-contained under the repository's
-# 3rdpart directory.  Controller selection remains the single source macro in
-# px4ctrlfsm.h; no CMake option is required.
-get_filename_component(PX4CTRL_3RDPART_ROOT
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdpart" ABSOLUTE)
-set(PX4CTRL_OPTIMIZATION_ROOT "${PX4CTRL_3RDPART_ROOT}/optimization")
-set(PX4CTRL_CASADI_ROOT "${PX4CTRL_3RDPART_ROOT}/casadi")
-set(PX4CTRL_ACADOS_ROOT "${PX4CTRL_3RDPART_ROOT}/acados")
-set(PX4CTRL_ACADOS_GENERATED
-  "${PX4CTRL_ACADOS_ROOT}/generated/px4ctrl_nmpc")
+# All third-party libraries are built natively and installed into a normal
+# prefix (the provided script uses /usr/local).  3rdpart/src contains source
+# checkouts only and is deliberately not part of CMake's dependency search.
+find_package(Eigen3 3.3 CONFIG REQUIRED)
+find_package(casadi CONFIG REQUIRED)
+find_package(osqp 1.0 CONFIG REQUIRED)
+find_package(acados CONFIG REQUIRED)
+find_package(NLopt 2.7 CONFIG REQUIRED)
 
 find_path(IPOPT_INCLUDE_DIR NAMES IpIpoptApplication.hpp
-  PATHS "${PX4CTRL_OPTIMIZATION_ROOT}/include/coin" NO_DEFAULT_PATH REQUIRED)
-find_library(IPOPT_LIBRARY NAMES ipopt
-  PATHS "${PX4CTRL_OPTIMIZATION_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
-find_path(NLOPT_INCLUDE_DIR NAMES nlopt.hpp
-  PATHS "${PX4CTRL_OPTIMIZATION_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
-find_library(NLOPT_CXX_LIBRARY NAMES nlopt_cxx
-  PATHS "${PX4CTRL_OPTIMIZATION_ROOT}/lib/x86_64-linux-gnu"
-  NO_DEFAULT_PATH REQUIRED)
-find_package(casadi CONFIG REQUIRED
-  PATHS "${PX4CTRL_CASADI_ROOT}/cmake" NO_DEFAULT_PATH)
-find_library(ACADOS_LIBRARY NAMES acados
-  PATHS "${PX4CTRL_ACADOS_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
-find_library(HPIPM_LIBRARY NAMES hpipm
-  PATHS "${PX4CTRL_ACADOS_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
-find_library(BLASFEO_LIBRARY NAMES blasfeo
-  PATHS "${PX4CTRL_ACADOS_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
-find_library(PX4CTRL_ACADOS_SOLVER_LIBRARY
-  NAMES acados_ocp_solver_px4ctrl_nmpc
-  PATHS "${PX4CTRL_ACADOS_GENERATED}" NO_DEFAULT_PATH REQUIRED)
+  PATH_SUFFIXES coin-or coin REQUIRED)
+find_library(IPOPT_LIBRARY NAMES ipopt REQUIRED)
 
-# gptmpc/gpttraj assemble QPs with Eigen and call the system OSQP C API.
-find_path(OSQP_INCLUDE_DIR osqp/osqp.h PATHS /usr/local/include /usr/include REQUIRED)
-find_library(OSQP_LIBRARY NAMES osqp PATHS /usr/local/lib /usr/lib REQUIRED)
+set(PX4CTRL_ACADOS_GENERATED
+  "${CMAKE_CURRENT_SOURCE_DIR}/generated/acados/px4ctrl_nmpc")
 
-include_directories(
-  include
-  ${EIGEN_INCLUDE_DIRS}
-  ${OSQP_INCLUDE_DIR}
-)
+# px4ctrlrate_node uses the system SuiteSparse/UMFPACK development package.
+find_path(UMFPACK_INCLUDE_DIR NAMES suitesparse/umfpack.h REQUIRED)
+find_library(UMFPACK_LIBRARY NAMES umfpack REQUIRED)
+
+message(STATUS "px4ctrl Eigen: Eigen3::Eigen")
+message(STATUS "px4ctrl OSQP: osqp::osqp")
+message(STATUS "px4ctrl Ipopt: ${IPOPT_LIBRARY}")
+message(STATUS "px4ctrl NLopt: NLopt::nlopt")
+message(STATUS "px4ctrl acados: acados")
+message(STATUS "px4ctrl UMFPACK: ${UMFPACK_LIBRARY}")
+
+# The generated solver belongs to px4ctrl, so build it on the target machine
+# instead of committing or locating a prebuilt libacados_ocp_solver*.so.
+add_library(px4ctrl_acados_ocp_solver STATIC
+  "${PX4CTRL_ACADOS_GENERATED}/acados_solver_px4ctrl_nmpc.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_model/px4ctrl_nmpc_expl_ode_fun.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_model/px4ctrl_nmpc_expl_vde_forw.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_model/px4ctrl_nmpc_expl_vde_adj.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_cost/px4ctrl_nmpc_cost_y_0_fun.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_cost/px4ctrl_nmpc_cost_y_0_fun_jac_ut_xt.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_cost/px4ctrl_nmpc_cost_y_0_hess.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_cost/px4ctrl_nmpc_cost_y_fun.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_cost/px4ctrl_nmpc_cost_y_fun_jac_ut_xt.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_cost/px4ctrl_nmpc_cost_y_hess.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_cost/px4ctrl_nmpc_cost_y_e_fun.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_cost/px4ctrl_nmpc_cost_y_e_fun_jac_ut_xt.c"
+  "${PX4CTRL_ACADOS_GENERATED}/px4ctrl_nmpc_cost/px4ctrl_nmpc_cost_y_e_hess.c")
+target_include_directories(px4ctrl_acados_ocp_solver PUBLIC
+  "${PX4CTRL_ACADOS_GENERATED}")
+target_link_libraries(px4ctrl_acados_ocp_solver PUBLIC acados hpipm blasfeo m)
 
 # CasADi is isolated behind a plain-C bridge so no CasADi C++ type enters the
 # public controller interface.
 add_library(px4ctrl_casadi_nmpc_bridge STATIC
   src/solver_nmpc_casadi_bridge.cpp)
 target_include_directories(px4ctrl_casadi_nmpc_bridge PRIVATE
-  "${PX4CTRL_CASADI_ROOT}/include")
+  "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(px4ctrl_casadi_nmpc_bridge PRIVATE casadi::casadi)
 
 # sun: 顶层目标包含输入转换、状态机、外环控制器、参数和坐标变换实现。
@@ -119,31 +124,17 @@ ament_target_dependencies(px4ctrl_node
   std_srvs
 )
 target_include_directories(px4ctrl_node SYSTEM PRIVATE
-  "${IPOPT_INCLUDE_DIR}"
-  "${NLOPT_INCLUDE_DIR}"
-  "${PX4CTRL_ACADOS_GENERATED}"
-  "${PX4CTRL_ACADOS_ROOT}/include"
-  "${PX4CTRL_ACADOS_ROOT}/include/acados"
-  "${PX4CTRL_ACADOS_ROOT}/include/blasfeo/include"
-  "${PX4CTRL_ACADOS_ROOT}/include/hpipm/include")
+  "${IPOPT_INCLUDE_DIR}")
+target_include_directories(px4ctrl_node PRIVATE include)
 target_compile_definitions(px4ctrl_node PRIVATE HAVE_CSTDDEF)
 target_link_libraries(px4ctrl_node
-  ${OSQP_LIBRARY}
+  Eigen3::Eigen
+  osqp::osqp
   ${IPOPT_LIBRARY}
-  ${NLOPT_CXX_LIBRARY}
+  NLopt::nlopt
   px4ctrl_casadi_nmpc_bridge
-  ${PX4CTRL_ACADOS_SOLVER_LIBRARY}
-  ${ACADOS_LIBRARY}
-  ${HPIPM_LIBRARY}
-  ${BLASFEO_LIBRARY}
+  px4ctrl_acados_ocp_solver
   m)
-# Solver plugins and their transitive libraries all live below 3rdpart.
-target_link_options(px4ctrl_node PRIVATE "LINKER:--disable-new-dtags")
-set_target_properties(px4ctrl_node PROPERTIES
-  BUILD_RPATH
-    "${PX4CTRL_OPTIMIZATION_ROOT}/lib;${PX4CTRL_OPTIMIZATION_ROOT}/lib/x86_64-linux-gnu;${PX4CTRL_ACADOS_GENERATED};${PX4CTRL_ACADOS_ROOT}/lib;/usr/local/lib;${PX4CTRL_CASADI_ROOT}"
-  INSTALL_RPATH
-    "${PX4CTRL_OPTIMIZATION_ROOT}/lib;${PX4CTRL_OPTIMIZATION_ROOT}/lib/x86_64-linux-gnu;${PX4CTRL_ACADOS_GENERATED};${PX4CTRL_ACADOS_ROOT}/lib;/usr/local/lib;${PX4CTRL_CASADI_ROOT}")
 
 add_executable(gpttraj_visualizer_node
   src/gpttraj_visualizer_node.cpp
@@ -155,7 +146,10 @@ ament_target_dependencies(gpttraj_visualizer_node
   geometry_msgs
   visualization_msgs
 )
-target_link_libraries(gpttraj_visualizer_node ${OSQP_LIBRARY})
+target_include_directories(gpttraj_visualizer_node SYSTEM PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(gpttraj_visualizer_node PRIVATE include)
+target_link_libraries(gpttraj_visualizer_node Eigen3::Eigen osqp::osqp)
 
 # sun: 底层目标依赖 SuiteSparse/UMFPACK，为滑动窗口 TV 正则微分求解稀疏线性系统。
 add_executable(px4ctrlrate_node 
@@ -174,7 +168,10 @@ ament_target_dependencies(px4ctrlrate_node
   ratectrl_msgs
   std_srvs
 )
-target_link_libraries(px4ctrlrate_node umfpack)
+target_include_directories(px4ctrlrate_node SYSTEM PRIVATE
+  "${UMFPACK_INCLUDE_DIR}")
+target_include_directories(px4ctrlrate_node PRIVATE include)
+target_link_libraries(px4ctrlrate_node Eigen3::Eigen ${UMFPACK_LIBRARY})
 
 install(TARGETS px4ctrl_node DESTINATION lib/${PROJECT_NAME})
 install(TARGETS px4ctrlrate_node DESTINATION lib/${PROJECT_NAME})

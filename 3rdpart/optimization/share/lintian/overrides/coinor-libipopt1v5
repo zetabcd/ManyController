@@ -1,2 +1,0 @@
-# All the coinor packages preced the library package name with coinor-
-coinor-libipopt1v5: package-name-doesnt-match-sonames libipopt1
