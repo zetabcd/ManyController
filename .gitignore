@@ -1,0 +1,62 @@
+# ROS 2 / colcon build output
+/build/
+/install/
+/log/
+
+# Runtime and simulation output
+/sim_log/
+/MUJOCO_LOG.TXT
+*.bag
+*.bag.active
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+
+# Editors, language servers, and local agent settings
+/.vscode/
+/.idea/
+/.cache/
+/.agents/
+/.codex/
+*.code-workspace
+.clangd/
+compile_commands.json
+
+# CMake and C/C++ build artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+Makefile
+cmake_install.cmake
+CTestTestfile.cmake
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Logs, temporary files, and editor backups
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db

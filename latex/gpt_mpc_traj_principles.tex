@@ -1,0 +1,531 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage{booktabs,longtable}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\geometry{left=24mm,right=24mm,top=24mm,bottom=26mm}
+\hypersetup{colorlinks=true,linkcolor=blue!55!black,urlcolor=blue!55!black}
+\setlist{nosep}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\SO}{\mathrm{SO}(3)}
+\newcommand{\Exp}{\operatorname{Exp}}
+\newcommand{\Log}{\operatorname{Log}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\clip}{\operatorname{clip}}
+% Do not call this command \skew: LaTeX already defines \skew for adjusting
+% math accents, and overriding it breaks amsmath's align environment.
+\newcommand{\skewmat}[1]{\left\lfloor #1\right\rfloor_\times}
+\newcommand{\normQ}[2]{\left\lVert #1\right\rVert_{#2}^{2}}
+\newcommand{\pseudocode}[1]{%
+  \begin{center}
+  \fbox{\begin{minipage}{0.94\linewidth}\small #1\end{minipage}}
+  \end{center}}
+
+\title{GPT 四旋翼流形 MPC 与轨迹优化\\数学原理及实现伪代码}
+\author{对应工程文件：\texttt{gptmpc.cpp/.h} 与 \texttt{gpttraj.cpp/.h}}
+\date{2026年8月}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{文档范围}
+
+本文说明工程中以下四个文件所实现的算法，而不是对参考论文的逐字复述：
+\begin{itemize}
+  \item \texttt{src/realflight\_modules/px4ctrl/include/px4ctrl/gptmpc.h}；
+  \item \texttt{src/realflight\_modules/px4ctrl/src/gptmpc.cpp}；
+  \item \texttt{src/realflight\_modules/px4ctrl/include/px4ctrl/gpttraj.h}；
+  \item \texttt{src/realflight\_modules/px4ctrl/src/gpttraj.cpp}。
+\end{itemize}
+
+控制器以总推力加速度和机体角速度为直接输入，在
+$\R^3\times\R^3\times\SO$ 上构造误差状态 MPC。轨迹优化器使用逐次凸化
+（Sequential Convex Programming, SCP），每轮以 Eigen 构造稀疏二次规划，
+再由 OSQP 求解。
+
+\section{坐标系、状态与输入}
+
+\subsection{工程坐标系}
+
+工程内部采用 ENU 惯性坐标系和 FLU 机体系。姿态矩阵
+\begin{equation}
+  \bm R\in\SO
+\end{equation}
+将机体系向量主动旋转到惯性系；其第三列
+$\bm R\bm e_3$ 是正总推力在惯性系中的方向，其中
+$\bm e_3=[0,0,1]^\mathsf T$。这与 Lu.pdf 中采用的 FRD 机体系不同，
+因此本实现中的推力项及姿态雅可比符号也相应改变。
+
+\subsection{状态和控制量}
+
+无人机状态和控制输入定义为
+\begin{align}
+  \bm x &= (\bm p,\bm v,\bm R)
+  \in \mathcal M=\R^3\times\R^3\times\SO, \\
+  \bm u &=
+  \begin{bmatrix}a_T&\bm\omega^\mathsf T\end{bmatrix}^{\mathsf T}
+  \in\R^4,
+\end{align}
+其中 $\bm p$、$\bm v$ 是惯性系位置和速度，$a_T$ 是沿机体 $+z$
+方向的总推力加速度，$\bm\omega$ 是 FLU 机体系角速度。
+
+忽略气动阻力时，连续动力学为
+\begin{align}
+  \dot{\bm p} &= \bm v, \\
+  \dot{\bm v} &= -g\bm e_3+a_T\bm R\bm e_3, \\
+  \dot{\bm R} &= \bm R\skewmat{\bm\omega}.
+  \label{eq:continuous_model}
+\end{align}
+这里 $g>0$。控制器最终输出给工程底层的是牛顿制总推力
+\begin{equation}
+  T=m a_T,
+  \label{eq:thrust_conversion}
+\end{equation}
+以及角速度 $\bm\omega$。
+
+\subsection{离散传播}
+
+采样周期为 $\Delta t$ 时，实际代码采用
+\begin{align}
+  \bm p_{k+1} &= \bm p_k+\Delta t\,\bm v_k,\\
+  \bm v_{k+1} &= \bm v_k+\Delta t
+  \left(-g\bm e_3+a_{T,k}\bm R_k\bm e_3\right),\\
+  \bm R_{k+1} &= \bm R_k\Exp(\Delta t\,\bm\omega_k).
+  \label{eq:discrete_model}
+\end{align}
+最后一式通过指数映射传播旋转，因此不会破坏
+$\bm R^\mathsf T\bm R=\bm I$ 和 $\det\bm R=1$。
+
+\section{$\SO$ 上的局部坐标}
+
+\subsection{帽算子与指数/对数映射}
+
+对 $\bm\phi=[\phi_x,\phi_y,\phi_z]^\mathsf T$，定义
+\begin{equation}
+  \skewmat{\bm\phi}=
+  \begin{bmatrix}
+    0&-\phi_z&\phi_y\\
+    \phi_z&0&-\phi_x\\
+    -\phi_y&\phi_x&0
+  \end{bmatrix}.
+\end{equation}
+旋转向量通过 Rodrigues 公式映射为旋转矩阵：
+\begin{equation}
+  \Exp(\bm\phi)=
+  \bm I+\frac{\sin\theta}{\theta}\skewmat{\bm\phi}
+  +\frac{1-\cos\theta}{\theta^2}\skewmat{\bm\phi}^{2},
+  \qquad \theta=\lVert\bm\phi\rVert_2.
+\end{equation}
+
+\subsection{流形加减法}
+
+对九维局部增量
+\begin{equation}
+  \delta\bm x=
+  \begin{bmatrix}
+    \delta\bm p^\mathsf T&
+    \delta\bm v^\mathsf T&
+    \delta\bm\theta^\mathsf T
+  \end{bmatrix}^{\mathsf T}\in\R^9,
+\end{equation}
+本实现使用右扰动：
+\begin{equation}
+  \bm x\boxplus\delta\bm x=
+  \left(
+    \bm p+\delta\bm p,
+    \bm v+\delta\bm v,
+    \bm R\Exp(\delta\bm\theta)
+  \right).
+  \label{eq:boxplus}
+\end{equation}
+两个状态之间的最小局部误差为
+\begin{equation}
+  \bm x\boxminus\bm x^d=
+  \begin{bmatrix}
+    \bm p-\bm p^d\\
+    \bm v-\bm v^d\\
+    \Log\!\left((\bm R^d)^\mathsf T\bm R\right)
+  \end{bmatrix}\in\R^9.
+  \label{eq:boxminus}
+\end{equation}
+因此优化变量只有九维，不需要四元数单位模约束，也不存在欧拉角奇异点。
+
+\section{流形模型预测控制}
+
+\subsection{参考轨迹}
+
+控制器接受三种参考来源，优先级如下：
+\begin{enumerate}
+  \item 由 \texttt{setTrajectory()} 设置的优化轨迹；
+  \item 由 \texttt{setReferencePreview()} 设置的至少 $N+1$ 个参考点；
+  \item 当前控制周期传入的单个 \texttt{Ref\_State\_t}。
+\end{enumerate}
+
+对第三种情况，代码用常加速度外推
+\begin{align}
+  \bm p_k^d &= \bm p^d+t_k\bm v^d+\frac{1}{2}t_k^2\bm a^d,\\
+  \bm v_k^d &= \bm v^d+t_k\bm a^d,
+\end{align}
+并令期望比力为
+\begin{equation}
+  \bm f_k^d=\bm a^d+t_k\bm j^d+g\bm e_3,
+  \qquad a_{T,k}^d=\clip
+  \left(\lVert\bm f_k^d\rVert_2,a_{T,\min},a_{T,\max}\right).
+\end{equation}
+以 $\bm z_B^d=\bm f_k^d/\lVert\bm f_k^d\rVert_2$ 和参考偏航角构造
+$\bm R_k^d$。参考角速度由相邻参考姿态差分得到：
+\begin{equation}
+  \bm\omega_k^d=\frac{1}{\Delta t}
+  \Log\!\left((\bm R_k^d)^\mathsf T\bm R_{k+1}^d\right).
+\end{equation}
+
+\subsection{仿射误差动力学}
+
+记离散非线性传播映射为
+\begin{equation}
+  \bm x_{k+1}=F_d(\bm x_k,\bm u_k).
+\end{equation}
+在参考点 $(\bm x_k^d,\bm u_k^d)$ 附近定义
+\begin{align}
+  \delta\bm x_k &= \bm x_k\boxminus\bm x_k^d,\\
+  \delta\bm u_k &= \bm u_k-\bm u_k^d.
+\end{align}
+则下一时刻误差映射为
+\begin{equation}
+  \mathcal E_k(\delta\bm x_k,\delta\bm u_k)=
+  F_d(\bm x_k^d\boxplus\delta\bm x_k,
+      \bm u_k^d+\delta\bm u_k)
+  \boxminus\bm x_{k+1}^d.
+\end{equation}
+
+代码使用前向有限差分计算雅可比：
+\begin{align}
+  \bm A_k(:,i)&\approx
+  \frac{\mathcal E_k(\epsilon\bm e_i,\bm0)
+        -\mathcal E_k(\bm0,\bm0)}{\epsilon},\\
+  \bm B_k(:,j)&\approx
+  \frac{\mathcal E_k(\bm0,\epsilon\bm e_j)
+        -\mathcal E_k(\bm0,\bm0)}{\epsilon},\\
+  \bm c_k&=\mathcal E_k(\bm0,\bm0),
+  \qquad \epsilon=10^{-6}.
+\end{align}
+从而得到
+\begin{equation}
+  \delta\bm x_{k+1}
+  =\bm A_k\delta\bm x_k
+  +\bm B_k\delta\bm u_k+\bm c_k.
+  \label{eq:affine_error_model}
+\end{equation}
+$\bm c_k$ 是参考轨迹的动力学缺陷；即使输入的参考并非严格动力学可行，
+它仍会进入预测模型，而不会被静默忽略。
+
+\subsection{预测模型凝聚}
+
+递推式~\eqref{eq:affine_error_model} 可写成
+\begin{equation}
+  \delta\bm x_k=\bm\Phi_k\delta\bm x_0
+  +\sum_{j=0}^{k-1}\bm\Gamma_{k,j}\delta\bm u_j
+  +\bm\eta_k.
+\end{equation}
+堆叠未来状态和输入：
+\begin{align}
+  \delta\bm X&=
+  \begin{bmatrix}
+    \delta\bm x_1^\mathsf T&\cdots&\delta\bm x_N^\mathsf T
+  \end{bmatrix}^{\mathsf T},\\
+  \delta\bm U&=
+  \begin{bmatrix}
+    \delta\bm u_0^\mathsf T&\cdots&\delta\bm u_{N-1}^\mathsf T
+  \end{bmatrix}^{\mathsf T},
+\end{align}
+得到凝聚预测模型
+\begin{equation}
+  \delta\bm X
+  =\bm S_x\delta\bm x_0+\bm S_u\delta\bm U+\bm s_c.
+  \label{eq:condensed_prediction}
+\end{equation}
+
+\subsection{代价函数和 QP}
+
+有限时域代价为
+\begin{equation}
+  J=\sum_{k=1}^{N}\normQ{\delta\bm x_k}{\bm Q_k}
+  +\sum_{k=0}^{N-1}\normQ{\delta\bm u_k}{\bm R_k}.
+\end{equation}
+其中默认 $N=8$，状态权重和输入权重取
+\begin{align}
+  \bm Q_k&=\diag(15000,15000,15000,40,40,40,80,80,80),\\
+  \bm R_k&=\diag(0.5,0.6,0.6,0.6).
+\end{align}
+
+令 $\bm z=\bm S_x\delta\bm x_0+\bm s_c$，代入
+式~\eqref{eq:condensed_prediction}，可化为 OSQP 使用的标准形式
+\begin{equation}
+  \min_{\delta\bm U}\quad
+  \frac12\delta\bm U^\mathsf T\bm H\delta\bm U
+  +\bm q^\mathsf T\delta\bm U,
+\end{equation}
+其中
+\begin{align}
+  \bm H&=2(\bm S_u^\mathsf T\bar{\bm Q}\bm S_u+\bar{\bm R}),\\
+  \bm q&=2\bm S_u^\mathsf T\bar{\bm Q}\bm z.
+\end{align}
+
+控制约束转换为增量约束：
+\begin{align}
+  a_{T,\min}-a_{T,k}^d
+  &\leq \delta a_{T,k}
+  \leq a_{T,\max}-a_{T,k}^d,\\
+  -\bm\omega_{\max}-\bm\omega_k^d
+  &\leq \delta\bm\omega_k
+  \leq \bm\omega_{\max}-\bm\omega_k^d.
+\end{align}
+求解后只执行第一项，即滚动时域策略
+\begin{equation}
+  \bm u_{\mathrm{cmd}}=\bm u_0^d+\delta\bm u_0^\star.
+\end{equation}
+
+\subsection{MPC 伪代码}
+
+\pseudocode{
+\textbf{算法 1：\texttt{GptMpcControl::calculateControl}}\\[2mm]
+\textbf{输入：}当前状态 $(\bm p,\bm v,\bm R)$，参考状态/轨迹，参数 $m,g$，周期 $\Delta t$\\
+\textbf{输出：}总推力 $T$，机体角速度 $\bm\omega_{\rm cmd}$
+\begin{enumerate}[label=\arabic*.]
+  \item 若处于手动模式：计算姿态误差比例角速度，按油门映射总推力，然后返回。
+  \item 从优化轨迹、预览序列或单点参考中构造 $N+1$ 个参考状态及 $N$ 个参考输入。
+  \item 用式~\eqref{eq:boxminus} 计算当前九维误差 $\delta\bm x_0$。
+  \item 对 $k=0,\ldots,N-1$：
+  \begin{enumerate}[label*=\arabic*.]
+    \item 用式~\eqref{eq:discrete_model} 定义流形误差传播 $\mathcal E_k$；
+    \item 以有限差分计算 $\bm A_k,\bm B_k$；
+    \item 保存参考动力学缺陷 $\bm c_k$。
+  \end{enumerate}
+  \item 递推构造 $\bm S_x,\bm S_u,\bm s_c$。
+  \item 构造 Hessian $\bm H$、梯度 $\bm q$ 以及输入上下界。
+  \item 用 Eigen 转为 CSC 稀疏矩阵，调用 OSQP 求解 $\delta\bm U^\star$。
+  \item 若求解成功，取 $\bm u_0^d+\delta\bm u_0^\star$；否则保持上一周期输入并重新限幅。
+  \item 按式~\eqref{eq:thrust_conversion} 输出 $T=m a_T$ 和 $\bm\omega_{\rm cmd}$。
+\end{enumerate}}
+
+\section{SCP 轨迹优化}
+
+\subsection{优化目标}
+
+给定初始状态、终端状态和若干中间航点，轨迹优化器寻找满足
+式~\eqref{eq:discrete_model} 及输入边界的短时间轨迹。当前实现将总时间搜索
+与固定时间下的 SCP 分开：外层逐步缩短 $t_f$，内层对每个给定的 $t_f$
+求解一系列凸 QP。
+
+时间均匀离散为 $n$ 段：
+\begin{equation}
+  \Delta t=\frac{t_f}{n},\qquad k=0,\ldots,n.
+\end{equation}
+
+\subsection{初始轨迹}
+
+令折线路径依次连接起点、中间航点和终点，总弧长为 $L$。初始位置按弧长
+均匀插值；内部节点速度用中心差分：
+\begin{equation}
+  \bm v_k=\frac{\bm p_{k+1}-\bm p_{k-1}}{2\Delta t}.
+\end{equation}
+再由速度差分估计加速度，并用
+$\bm a_k+g\bm e_3$ 构造推力方向和初始姿态。初始控制量为
+\begin{align}
+  a_{T,k}&=\clip\left(
+  \left(\frac{\bm v_{k+1}-\bm v_k}{\Delta t}+g\bm e_3\right)^\mathsf T
+  \bm R_k\bm e_3,
+  a_{T,\min},a_{T,\max}\right),\\
+  \bm\omega_k&=\frac1{\Delta t}
+  \Log(\bm R_k^\mathsf T\bm R_{k+1}).
+\end{align}
+
+\subsection{每轮 SCP 子问题}
+
+第 $\ell$ 轮的名义轨迹为
+$(\bm x_k^\ell,\bm u_k^\ell)$。优化变量为
+\begin{equation}
+  \bm y=\left\{
+  \delta\bm x_0,\ldots,\delta\bm x_n,
+  \delta\bm u_0,\ldots,\delta\bm u_{n-1},
+  \bm d_0,\ldots,\bm d_{n-1}
+  \right\},
+\end{equation}
+其中 $\bm d_k\in\R^9$ 是虚拟控制，用于防止线性化子问题人为不可行。
+
+在名义轨迹处用与 MPC 相同的方法计算 $\bm A_k,\bm B_k,\bm c_k$，
+并施加
+\begin{equation}
+  \delta\bm x_{k+1}
+  =\bm A_k\delta\bm x_k
+  +\bm B_k\delta\bm u_k+\bm c_k+\bm d_k.
+  \label{eq:scp_dynamics}
+\end{equation}
+
+边界条件为
+\begin{align}
+  \delta\bm x_0&=\bm0,\\
+  \delta\bm x_n&=\bm x_f\boxminus\bm x_n^\ell.
+\end{align}
+
+当前代码按折线累计弧长为中间航点分配有序离散节点 $\kappa_j$：
+\begin{equation}
+  \kappa_j\approx
+  \operatorname{round}\left(n\frac{L_j}{L}\right),
+  \qquad 1\leq\kappa_1<\cdots<\kappa_M\leq n-1.
+\end{equation}
+球形容差在 QP 中用保守的轴对齐盒约束实现：
+\begin{equation}
+  -\frac{r_j}{\sqrt3}\bm1
+  \leq
+  \bm p_{\kappa_j}^\ell+\delta\bm p_{\kappa_j}-\bm p_j^w
+  \leq
+  \frac{r_j}{\sqrt3}\bm1.
+  \label{eq:waypoint_box}
+\end{equation}
+若式~\eqref{eq:waypoint_box} 成立，则必有
+$\lVert\bm p_{\kappa_j}-\bm p_j^w\rVert_2\leq r_j$。
+
+信赖域逐分量表示为
+\begin{align}
+  \lVert\delta\bm p_k\rVert_\infty&\leq\rho_p,\\
+  \lVert\delta\bm v_k\rVert_\infty&\leq\rho_v,\\
+  \lVert\delta\bm\theta_k\rVert_\infty&\leq\rho_R.
+\end{align}
+输入增量边界与 MPC 相同。
+
+实际实现的凸二次代价为
+\begin{align}
+  J_{\rm SCP}={}&
+  w_x\sum_{k=0}^{n}\lVert\delta\bm x_k\rVert_2^2
+  +w_u\sum_{k=0}^{n-1}\lVert\delta\bm u_k\rVert_2^2\\
+  &+w_{\Delta u}\sum_{k=1}^{n-1}
+  \lVert\delta\bm u_k-\delta\bm u_{k-1}\rVert_2^2
+  +w_d\sum_{k=0}^{n-1}\lVert\bm d_k\rVert_2^2.
+  \label{eq:scp_cost}
+\end{align}
+$w_d$ 取很大值，使虚拟控制仅在必要时出现。QP 解通过
+\begin{align}
+  \bm p_k^{\ell+1}&=\bm p_k^\ell+\delta\bm p_k^\star,\\
+  \bm v_k^{\ell+1}&=\bm v_k^\ell+\delta\bm v_k^\star,\\
+  \bm R_k^{\ell+1}&=\bm R_k^\ell\Exp(\delta\bm\theta_k^\star),\\
+  \bm u_k^{\ell+1}&=\bm u_k^\ell+\delta\bm u_k^\star
+\end{align}
+映射回原状态空间。
+
+收敛条件同时检查最大状态更新和虚拟控制：
+\begin{equation}
+  \max_k\lVert\delta\bm x_k^\star\rVert_\infty<\epsilon_x,
+  \qquad
+  \max_k\lVert\bm d_k^\star\rVert_\infty<\epsilon_d.
+\end{equation}
+
+\subsection{飞行时间搜索}
+
+初始总时间由路径长度估计：
+\begin{equation}
+  t_f^{(0)}=\clip
+  \left(1.5\frac{L}{v_{\rm init}},t_{\min},t_{\max}\right).
+\end{equation}
+若该时间不可行，则逐步放大；找到第一个可行时间后，以缩放因子
+$\gamma\in(0,1)$ 尝试
+\begin{equation}
+  t_{\rm trial}=\max(t_{\min},\gamma t_{\rm feasible}),
+\end{equation}
+并结合可行/不可行时间区间的中点更新搜索。这里的 ``可行'' 指 OSQP 成功，
+且 SCP 结束时最大虚拟控制不超过给定阈值。
+
+\subsection{轨迹优化伪代码}
+
+\pseudocode{
+\textbf{算法 2：固定总时间下的 SCP}\\[2mm]
+\textbf{输入：}边界状态、航点、总时间 $t_f$、离散段数 $n$\\
+\textbf{输出：}动力学可行轨迹或失败状态
+\begin{enumerate}[label=\arabic*.]
+  \item 沿起点--航点--终点折线初始化 $\bm p_k,\bm v_k,\bm R_k,\bm u_k$。
+  \item 依据累计弧长计算严格递增的航点节点 $\kappa_j$。
+  \item 对 $\ell=0,\ldots,L_{\rm SCP}-1$：
+  \begin{enumerate}[label*=\arabic*.]
+    \item 沿名义轨迹有限差分计算 $\bm A_k,\bm B_k,\bm c_k$；
+    \item 创建变量 $\delta\bm x_k,\delta\bm u_k,\bm d_k$；
+    \item 按式~\eqref{eq:scp_cost} 构造稀疏 Hessian；
+    \item 加入边界、式~\eqref{eq:scp_dynamics}、航点、信赖域及输入边界约束；
+    \item 转换为 $\bm l\leq\bm A\bm y\leq\bm u$，调用 OSQP；
+    \item 若 OSQP 失败，返回不可行；
+    \item 用 $\boxplus$ 更新名义状态，用向量加法更新输入；
+    \item 若状态更新及虚拟控制均低于阈值，则终止 SCP。
+  \end{enumerate}
+  \item 若最大虚拟控制小于动力学容差，返回成功；否则返回不可行。
+\end{enumerate}}
+
+\pseudocode{
+\textbf{算法 3：外层时间搜索}\\[2mm]
+\begin{enumerate}[label=\arabic*.]
+  \item 根据路径长度和初始速度估计 $t_f^{(0)}$。
+  \item 调用算法 2；若失败且未达到 $t_{\max}$，放大 $t_f$ 后重试。
+  \item 保存当前可行轨迹和可行时间上界。
+  \item 在规定次数内缩短飞行时间，并再次调用算法 2：
+  \begin{itemize}
+    \item 成功：保存更短轨迹，收紧可行时间上界；
+    \item 失败：提高不可行时间下界。
+  \end{itemize}
+  \item 返回找到的最短可行轨迹。
+\end{enumerate}}
+
+\section{OSQP 与 Eigen 数据接口}
+
+两种算法最终都求解
+\begin{equation}
+  \begin{aligned}
+  \min_{\bm y}\quad &\frac12\bm y^\mathsf T\bm P\bm y+\bm q^\mathsf T\bm y,\\
+  \text{s.t.}\quad &\bm l\leq\bm A\bm y\leq\bm u.
+  \end{aligned}
+\end{equation}
+实现步骤为：
+\begin{enumerate}
+  \item 使用 Eigen 稠密或 \texttt{Triplet} 形式组装矩阵；
+  \item 转换为列压缩 CSC 存储；
+  \item $\bm P$ 只向 OSQP 传入上三角部分；
+  \item 设置缩放、warm start、polishing 和收敛容差；
+  \item 接受 \texttt{solved} 或 \texttt{solved inaccurate} 状态；
+  \item 将 OSQP 解复制回 Eigen 向量并更新控制或轨迹。
+\end{enumerate}
+
+\section{实现边界与论文完整框架的区别}
+
+为避免把尚未实现的论文内容误写成现有功能，当前代码边界明确如下：
+\begin{itemize}
+  \item 已实现流形误差 MPC、推力/角速度直接输入、SCP 轨迹优化、输入边界、
+  信赖域、虚拟控制、外层时间搜索和逐轮轨迹历史记录。
+  \item 已把 $\lambda_k^j$、$\mu_k^j$、空间 CSTC 与严格顺序 CSTC 加入 QP；
+  基于折线弧长的节点仅用于 one-hot 初始化，航点经过时刻由优化器选择。
+  \item 轨迹成功条件同时检查动力学缺陷、航点互补残差、顺序互补残差和
+  CSTC 松弛量，OSQP 单轮成功本身不被当作原非凸问题成功。
+  \item 当前轨迹子问题使用虚拟控制的二范数平方惩罚，而论文公式给出的是
+  一范数惩罚；二范数形式可直接形成纯 QP。
+  \item 当前输入约束是总推力加速度和机体角速度盒约束，没有直接施加单电机
+  转速、力矩或旋翼分配约束。
+  \item 四个 GPT 文件未实现 CBF/HOCBF 避障、气动阻力补偿和 INDI 内环；
+  工程已有的角速度底层仍负责后续力矩控制及电机分配。
+  \item 有限差分雅可比提高了实现通用性，但比手工解析雅可比增加计算量。
+\end{itemize}
+
+\section{建议的调用流程}
+
+\begin{enumerate}
+  \item 创建 \texttt{GptTrajectoryOptimizer}，设置离散段数、推力和角速度边界。
+  \item 调用 \texttt{optimize(initial, terminal, waypoints)} 得到
+  \texttt{GptTrajectoryResult}。
+  \item 检查 \texttt{success}、动力学/航点/顺序残差、CSTC 松弛量和总时间。
+  \item 调用控制器的
+  \texttt{setTrajectory(result, start\_time)} 设置参考轨迹。
+  \item 每个外环周期调用与现有控制器兼容的 \texttt{calculateControl()}。
+  \item 将输出的牛顿制总推力和 FLU 机体系角速度发送给现有底层角速度节点。
+\end{enumerate}
+
+\end{document}

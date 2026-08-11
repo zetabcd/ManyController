@@ -1,0 +1,476 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+\usepackage{amsmath,amssymb,bm,mathtools,booktabs,longtable,enumitem,geometry,xcolor,hyperref}
+\geometry{left=23mm,right=23mm,top=23mm,bottom=25mm}
+\hypersetup{colorlinks=true,linkcolor=blue!55!black}
+\setlist{nosep}
+\newcommand{\SOthree}{\mathrm{SO}(3)}
+\newcommand{\ExpSO}{\operatorname{Exp}}
+\newcommand{\LogSO}{\operatorname{Log}}
+\newcommand{\clipop}{\operatorname{clip}}
+\newcommand{\nTwo}[1]{\left\lVert#1\right\rVert_2}
+\newcommand{\nInf}[1]{\left\lVert#1\right\rVert_\infty}
+\newcommand{\positive}[1]{\left[#1\right]_+}
+\newcommand{\algoBox}[1]{\begin{center}\fbox{\begin{minipage}{0.94\linewidth}\small#1\end{minipage}}\end{center}}
+
+\title{四旋翼流形轨迹优化的航点保证\\CSTC 实现、功能边界与数学推导}
+\author{对应 \texttt{gpttraj.cpp/.h} 与 \texttt{gptmpc.cpp/.h}}
+\date{2026年8月}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{问题的直接回答}
+
+当前实现已经把 $\lambda_k^j$、$\mu_k^j$、空间 CSTC 和严格顺序 CSTC
+加入 QP。折线弧长节点 $\kappa_j$ 现在只用于 one-hot 初值，经过时刻由优化器
+选择。只有动力学缺陷、原始空间互补残差、原始顺序互补残差和松弛量全部通过
+阈值检查，\texttt{success} 才会为真。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+ & 旧固定节点实现 & 当前 CSTC 进度变量实现\\
+\midrule
+是否经过航点 & 成功求解时可以保证 & 收敛且残差合格时可以保证\\
+经过时刻 & 预先指定为 $t_{\kappa_j}$ & 由优化器选择\\
+航点顺序 & 由 $\kappa_1<\cdots<\kappa_M$ 保证 & 由进度与互补约束保证\\
+可行域 & 较小，可能人为不可行 & 较大，允许航点时间移动\\
+QP 规模 & 较小 & 增加进度量、衰减量和松弛量\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+准确结论是：当前实现可联合优化各航点的离散经过时刻，并保证配置顺序；保证
+仍然是离散配点意义下的保证，其空间精度由航点半径与离散步长共同决定。
+
+\section{基础动力学与旧固定节点方法}
+
+\subsection{状态、输入和离散动力学}
+
+工程内部使用 ENU 惯性系和 FLU 机体系，$\bm R\in\SOthree$ 将机体系向量
+旋转到惯性系，正推力沿机体 $+z$。状态和输入为
+\begin{align}
+ \bm x_k&=(\bm p_k,\bm v_k,\bm R_k)
+ \in\mathbb R^3\times\mathbb R^3\times\SOthree,\\
+ \bm u_k&=[a_{T,k},\bm\omega_k^\mathsf T]^\mathsf T\in\mathbb R^4.
+\end{align}
+代码使用
+\begin{align}
+ \bm p_{k+1}&=\bm p_k+\Delta t\,\bm v_k,\\
+ \bm v_{k+1}&=\bm v_k+\Delta t(-g\bm e_3+a_{T,k}\bm R_k\bm e_3),\\
+ \bm R_{k+1}&=\bm R_k\ExpSO(\Delta t\,\bm\omega_k).
+ \label{eq:dynamics}
+\end{align}
+
+\subsection{流形局部误差}
+
+对名义状态 $\bar{\bm x}_k$，切空间增量为
+\[
+ \delta\bm x_k=[\delta\bm p_k^\mathsf T,\delta\bm v_k^\mathsf T,
+ \delta\bm\theta_k^\mathsf T]^\mathsf T\in\mathbb R^9.
+\]
+右扰动更新和状态差定义为
+\begin{align}
+ \bar{\bm x}\boxplus\delta\bm x
+ &=\left(\bar{\bm p}+\delta\bm p,\bar{\bm v}+\delta\bm v,
+ \bar{\bm R}\ExpSO(\delta\bm\theta)\right),\\
+ \bm x\boxminus\bar{\bm x}
+ &=\begin{bmatrix}\bm p-\bar{\bm p}\\
+ \bm v-\bar{\bm v}\\
+ \LogSO(\bar{\bm R}^{\mathsf T}\bm R)\end{bmatrix}.
+\end{align}
+它只使用三个姿态误差自由度，不需要四元数单位模约束，也没有欧拉角奇异性。
+
+\subsection{轨迹初始化}
+
+令起点、中间航点、终点组成折线
+\[
+ \bm c_0=\bm p_0,\quad \bm c_j=\bm p_j^w,\quad
+ \bm c_{M+1}=\bm p_f.
+\]
+累计弧长为
+\[
+ L_j=\sum_{i=1}^{j}\nTwo{\bm c_i-\bm c_{i-1}},\qquad L=L_{M+1}.
+\]
+代码沿折线按弧长均匀产生 $N+1$ 个初始位置，中心差分得到速度和加速度，
+再用 $\bm a_k+g\bm e_3$ 构造推力方向。初始输入为
+\begin{align}
+ \bar a_{T,k}&=\clipop\left[
+ \left(\frac{\bar{\bm v}_{k+1}-\bar{\bm v}_k}{\Delta t}+g\bm e_3\right)^\mathsf T
+ \bar{\bm R}_k\bm e_3,\ a_{T,\min},a_{T,\max}\right],\\
+ \bar{\bm\omega}_k&=\frac1{\Delta t}
+ \LogSO(\bar{\bm R}_k^\mathsf T\bar{\bm R}_{k+1}).
+\end{align}
+
+\subsection{SCP 动力学线性化}
+
+记式~\eqref{eq:dynamics} 的传播为 $F_d$，定义
+\[
+ \mathcal E_k(\delta\bm x,\delta\bm u)=
+ F_d(\bar{\bm x}_k\boxplus\delta\bm x,\bar{\bm u}_k+\delta\bm u)
+ \boxminus\bar{\bm x}_{k+1}.
+\]
+代码用 $\epsilon=10^{-6}$ 前向有限差分计算
+\begin{align}
+ \bm A_k(:,i)&\simeq\frac{\mathcal E_k(\epsilon\bm e_i,\bm0)
+ -\mathcal E_k(\bm0,\bm0)}{\epsilon},\\
+ \bm B_k(:,j)&\simeq\frac{\mathcal E_k(\bm0,\epsilon\bm e_j)
+ -\mathcal E_k(\bm0,\bm0)}{\epsilon},\\
+ \bm c_k&=\mathcal E_k(\bm0,\bm0).
+\end{align}
+加入虚拟控制 $\bm d_k$ 后，每轮 QP 约束为
+\begin{equation}
+ \delta\bm x_{k+1}=\bm A_k\delta\bm x_k+\bm B_k\delta\bm u_k
+ +\bm c_k+\bm d_k.
+ \label{eq:scp-dyn}
+\end{equation}
+只有最终 $\max_k\nInf{\bm d_k}$ 小于阈值，轨迹才判为动力学可行。
+
+\subsection{固定航点节点及保证证明}
+
+第 $j$ 个航点的原始节点取为
+\[
+ \kappa_j^{\rm raw}=\operatorname{round}\left(N\frac{L_j}{L}\right),
+\]
+随后截断以保证
+\[
+ 1\leq\kappa_1<\kappa_2<\cdots<\kappa_M\leq N-1.
+ \label{eq:k-order}
+\]
+对位置容差 $r_j$，QP 在节点 $\kappa_j$ 施加
+\begin{equation}
+ -\frac{r_j}{\sqrt3}\bm1\leq
+ \bar{\bm p}_{\kappa_j}+\delta\bm p_{\kappa_j}-\bm p_j^w
+ \leq\frac{r_j}{\sqrt3}\bm1.
+ \label{eq:box}
+\end{equation}
+令中间误差为 $\bm e_j$。由式~\eqref{eq:box}，
+\[
+ \nTwo{\bm e_j}^2=\sum_{i=1}^{3}e_{j,i}^2
+ \leq3\frac{r_j^2}{3}=r_j^2,
+\]
+故
+\begin{equation}
+ \nTwo{\bm p_{\kappa_j}-\bm p_j^w}\leq r_j.
+ \label{eq:guarantee}
+\end{equation}
+式~\eqref{eq:k-order} 又保证顺序。因此，只要 OSQP 成功、最终动力学缺陷
+低于阈值且输出轨迹未被后处理修改，规划轨迹一定在
+$t_j=\kappa_j\Delta t$ 进入每个航点容差球。$r_j=0$ 时就是精确通过给定点。
+
+这是参考轨迹的保证，不自动等于真实飞行保证。若已知跟踪误差上界
+$\nTwo{\bm p_{\rm actual}-\bm p_{\rm ref}}\leq e_{\max}$，要保证实际误差不超过
+$r_j^{\rm task}$，应设置
+\[
+ r_j^{\rm plan}\leq r_j^{\rm task}-e_{\max},\qquad
+ r_j^{\rm task}>e_{\max}.
+\]
+
+\subsection{当前 QP 和总时间搜索}
+
+当前变量为 $\bm z=[\delta\bm X^\mathsf T,\delta\bm U^\mathsf T,
+\bm D^\mathsf T]^\mathsf T$，代价为
+\begin{align}
+ J={}&w_x\sum_{k=0}^{N}\nTwo{\delta\bm x_k}^2
+ +w_u\sum_{k=0}^{N-1}\nTwo{\delta\bm u_k}^2\\
+ &+w_{\Delta u}\sum_{k=1}^{N-1}
+ \nTwo{\delta\bm u_k-\delta\bm u_{k-1}}^2
+ +w_d\sum_{k=0}^{N-1}\nTwo{\bm d_k}^2.
+\end{align}
+其余约束包括起终状态、位置/速度/姿态信赖域、推力加速度和角速度边界。
+最终形成 OSQP 标准形式
+\[
+ \min_{\bm z}\frac12\bm z^\mathsf T\bm P\bm z+\bm q^\mathsf T\bm z,
+ \qquad \bm l\leq\bm A\bm z\leq\bm u.
+\]
+外层先按 $t_f^{(0)}=\clipop(1.5L/v_{\rm init},t_{\min},t_{\max})$
+估计总时间，不可行则增大，得到可行解后逐步减小时间。
+
+\section{当前实现能做到和不能做到的功能}
+
+\begin{longtable}{p{0.29\linewidth}p{0.62\linewidth}}
+\toprule
+功能 & 当前能力\\
+\midrule\endhead
+起终状态 & 约束位置、速度和 $\SOthree$ 姿态。\\
+多航点通过 & 在严格递增的固定节点上施加硬约束，可证明进入容差球。\\
+全姿态轨迹 & 旋转矩阵传播、旋转向量优化，无欧拉角奇异性。\\
+动力学 & 使用推力加速度和机体角速度直接驱动。\\
+输入边界 & 总推力加速度与三轴角速度盒约束。\\
+控制平滑 & 惩罚相邻控制增量差。\\
+短时间搜索 & 外层可行性搜索，不是全局最优性证明。\\
+MPC 接口 & 输出牛顿制总推力和 FLU 机体系角速度。\\
+\bottomrule
+\end{longtable}
+
+当前不能宣称：自由优化航点经过时刻、CSTC 完整约束、全局时间最优、
+单电机转速/力矩约束、CBF 避障、气动阻力与 INDI，以及没有跟踪误差上界时
+对真实位置的严格保证。
+
+\section{为什么固定节点可能有问题}
+
+原始航点要求是
+\begin{equation}
+ \forall j,\ \exists k\in\{0,\ldots,N\}:\quad
+ \nTwo{\bm p_k-\bm p_j^w}\leq r_j.
+ \label{eq:exists}
+\end{equation}
+固定节点法将它加强为
+\[
+ \forall j:\quad\nTwo{\bm p_{\kappa_j}-\bm p_j^w}\leq r_j.
+\]
+后者蕴含前者，但反向不成立。因此它不会漏掉航点约束，却可能排除本来可行
+且更快的轨迹。例如真实可行轨迹在 $1.1$ 秒过第一个点，但固定节点要求它在
+$1.5$ 秒到达；新的时刻要求可能违反输入边界。
+
+\section{CSTC 改进方案及保证证明}
+
+\subsection{进度变量}
+
+对航点 $j=1,\ldots,M$，引入剩余进度和进度消耗量
+\[
+ \lambda_k^j\in[0,1],\qquad\mu_k^j\in[0,1].
+\]
+施加
+\begin{align}
+ \lambda_{k+1}^j&=\lambda_k^j-\mu_k^j,\quad k=0,\ldots,N-1,
+ \label{eq:progress}\\
+ \lambda_0^j&=1,\qquad\lambda_N^j=0,\qquad\mu_k^j\geq0.
+\end{align}
+递推可得
+\begin{equation}
+ \sum_{k=0}^{N-1}\mu_k^j=1.
+ \label{eq:sum-mu}
+\end{equation}
+
+\subsection{空间互补约束}
+
+定义距离残差
+\[
+ g_k^j(\bm p_k)=\nTwo{\bm p_k-\bm p_j^w}^2-r_j^2.
+\]
+加入
+\begin{equation}
+ \mu_k^j g_k^j(\bm p_k)\leq0,\qquad\mu_k^j\geq0.
+ \label{eq:spatial-cstc}
+\end{equation}
+若在航点球外，则 $g_k^j>0$，式~\eqref{eq:spatial-cstc} 强制
+$\mu_k^j=0$；若 $\mu_k^j>0$，则必有 $g_k^j\leq0$。
+
+由式~\eqref{eq:sum-mu} 和非负性，每个航点至少存在一个 $k_j$ 使
+$\mu_{k_j}^j>0$。空间互补随即推出
+\[
+ \nTwo{\bm p_{k_j}-\bm p_j^w}\leq r_j.
+\]
+所以进度递推、端点和空间互补共同构成航点必经性的严格证明。
+
+\subsection{严格顺序}
+
+弱顺序约束
+\[
+ \lambda_k^j\leq\lambda_k^{j+1}
+ \label{eq:weak-order}
+\]
+只保证前序航点累计完成度不小于后序航点，仍允许两者部分重叠。
+若要求后一航点必须等前一航点完全完成后才能开始，应增加
+\begin{equation}
+ \lambda_k^j\mu_k^{j+1}=0,\qquad j=1,\ldots,M-1.
+ \label{eq:strict-order}
+\end{equation}
+若 $\mu_k^{j+1}>0$，上式强制 $\lambda_k^j=0$。而
+\[
+ \lambda_k^j=1-\sum_{i=0}^{k-1}\mu_i^j,
+\]
+所以前一航点在节点 $k$ 之前已经消耗全部进度。建议同时保留弱顺序线性约束
+和严格顺序互补：前者加强凸子问题，后者给出最终严格逻辑。
+
+\section{将 CSTC 线性化并加入 OSQP}
+
+\subsection{扩展变量与进度递推}
+
+第 $\ell$ 轮名义值为 $\bar{\bm p},\bar\lambda,\bar\mu$，优化增量为
+$\delta\bm p,\delta\lambda,\delta\mu$。扩展变量排列为
+\[
+ \bm z_{\rm ext}=[
+ \delta\bm X^\mathsf T,\delta\bm U^\mathsf T,\bm D^\mathsf T,
+ \delta\bm\Lambda^\mathsf T,\delta\bm M^\mathsf T,
+ (\bm s^{\rm wp})^\mathsf T,(\bm s^{\rm ord})^\mathsf T]^\mathsf T.
+\]
+其中松弛量非负且最终应趋于零。令名义递推残差
+\[
+ r_{\lambda,k}^j=\bar\lambda_k^j-\bar\mu_k^j-\bar\lambda_{k+1}^j,
+\]
+则进度增量满足精确仿射式
+\begin{equation}
+ \delta\lambda_{k+1}^j-\delta\lambda_k^j+\delta\mu_k^j
+ =r_{\lambda,k}^j.
+ \label{eq:linear-progress}
+\end{equation}
+同时加入边界、$[0,1]$ 范围，以及弱顺序的增量形式
+\[
+ \delta\lambda_k^j-\delta\lambda_k^{j+1}
+ \leq\bar\lambda_k^{j+1}-\bar\lambda_k^j.
+\]
+
+\subsection{空间 CSTC 的一阶展开}
+
+定义
+\[
+ \phi_k^j(\bm p,\mu)=\mu\big(\nTwo{\bm p-\bm p_j^w}^2-r_j^2\big).
+\]
+令 $\bar{\bm e}_k^j=\bar{\bm p}_k-\bm p_j^w$，
+$\bar g_k^j=\nTwo{\bar{\bm e}_k^j}^2-r_j^2$，则
+\[
+ \phi_k^j\simeq
+ \bar\mu_k^j\bar g_k^j+
+ 2\bar\mu_k^j(\bar{\bm e}_k^j)^\mathsf T\delta\bm p_k+
+ \bar g_k^j\delta\mu_k^j.
+\]
+加入非负松弛后，OSQP 中使用
+\begin{equation}
+ 2\bar\mu_k^j(\bar{\bm e}_k^j)^\mathsf T\delta\bm p_k+
+ \bar g_k^j\delta\mu_k^j-s_{k,j}^{\rm wp}
+ \leq-\bar\mu_k^j\bar g_k^j.
+ \label{eq:linear-spatial}
+\end{equation}
+
+\subsection{严格顺序 CSTC 的一阶展开}
+
+对 $\psi_k^j=\lambda_k^j\mu_k^{j+1}$，一阶展开为
+\[
+ \psi_k^j\simeq
+ \bar\lambda_k^j\bar\mu_k^{j+1}
+ +\bar\mu_k^{j+1}\delta\lambda_k^j
+ +\bar\lambda_k^j\delta\mu_k^{j+1}.
+\]
+加入松弛得到
+\begin{equation}
+ \bar\mu_k^{j+1}\delta\lambda_k^j+
+ \bar\lambda_k^j\delta\mu_k^{j+1}-s_{k,j}^{\rm ord}
+ \leq-\bar\lambda_k^j\bar\mu_k^{j+1}.
+ \label{eq:linear-order}
+\end{equation}
+式~\eqref{eq:linear-progress}、\eqref{eq:linear-spatial} 和
+\eqref{eq:linear-order} 都是增量的仿射约束，可直接作为 OSQP 的矩阵行。
+
+\subsection{信赖域、代价和初始化}
+
+除状态信赖域外增加
+\[
+ |\delta\lambda_k^j|\leq\rho_\lambda,\qquad
+ |\delta\mu_k^j|\leq\rho_\mu.
+\]
+目标函数增加
+\begin{align}
+ J_{\rm cstc}={}&w_\mu\sum_{j,k}(\delta\mu_k^j)^2
+ +w_{s,\rm wp}\sum_{j,k}s_{k,j}^{\rm wp}
+ +w_{s,\rm ord}\sum_{j,k}s_{k,j}^{\rm ord}.
+ \label{eq:cstc-cost}
+\end{align}
+因为 $s\geq0$，松弛的一范数就是线性代价，仍属于 QP。
+
+当前固定节点结果可作为良好初值：
+\[
+ \bar\mu_k^j=\begin{cases}1,&k=\kappa_j,\\0,&k\neq\kappa_j,\end{cases}
+ \qquad
+ \bar\lambda_k^j=\begin{cases}1,&k\leq\kappa_j,\\0,&k>\kappa_j.\end{cases}
+\]
+后续 SCP 允许进度峰移动到相邻节点，从而让航点经过时刻成为优化结果。
+
+\subsection{非线性残差与验收}
+
+每轮更新后必须重新检查原始非线性约束：
+\begin{align}
+ r_{\rm wp}&=\max_{j,k}\positive{
+ \bar\mu_k^j(\nTwo{\bar{\bm p}_k-\bm p_j^w}^2-r_j^2)},\\
+ r_{\rm ord}&=\max_{j<M,k}|\bar\lambda_k^j\bar\mu_k^{j+1}|,\\
+ r_{\rm dyn}&=\max_k\nInf{\bm d_k},\\
+ r_s&=\max(\nInf{\bm s^{\rm wp}},\nInf{\bm s^{\rm ord}}).
+\end{align}
+只有四类残差、进度递推和输入边界都低于阈值时，才能宣布 CSTC 可行。
+OSQP 的 \texttt{solved} 只说明本轮凸 QP 成功，不代表原始非凸互补约束已经满足。
+
+\section{当前实现算法伪代码}
+
+\algoBox{
+\textbf{算法：带自由航点时刻和严格顺序的 SCP}
+\begin{enumerate}[label=\arabic*.]
+ \item 用当前折线法初始化 $\bar{\bm X},\bar{\bm U}$ 和 $\kappa_j$。
+ \item 以 one-hot 方式初始化 $\bar\mu$，由递推初始化 $\bar\lambda$。
+ \item 对每轮 SCP：
+ \begin{enumerate}[label*=\arabic*.]
+  \item 计算动力学 $\bm A_k,\bm B_k,\bm c_k$；
+  \item 计算 $\bar g_k^j$、空间互补和顺序互补梯度；
+  \item 创建扩展变量 $\bm z_{\rm ext}$；
+  \item 加入动力学、边界、输入限制和全部信赖域；
+  \item 加入进度递推、端点、范围和弱顺序约束；
+  \item 加入线性化空间 CSTC~\eqref{eq:linear-spatial}；
+  \item 加入线性化顺序 CSTC~\eqref{eq:linear-order}；
+  \item 构造原代价加式~\eqref{eq:cstc-cost}，调用 OSQP；
+  \item 更新状态、输入、$\lambda$ 和 $\mu$；
+  \item 计算原始非线性残差；全部合格则返回成功；
+  \item 若预测下降不可信则缩短信赖域，否则接受并适当放宽。
+ \end{enumerate}
+ \item 达到迭代上限仍未满足残差则返回失败。
+\end{enumerate}}
+
+外层时间搜索保持现有结构，但每次只把通过上述非线性验收的结果标为可行；
+缩短总时间时应将上一条可行的状态、输入和进度轨迹重采样作为 warm start。
+
+\section{代码实现位置与计算规模}
+
+在 \texttt{GptTrajectoryOptimizer::optimize()} 中已经：
+\begin{enumerate}
+ \item 保留 $\kappa_j$ 只用于初始化，删除每轮固定节点盒约束；
+ \item 新增 $(N+1)M$ 个 $\delta\lambda$、$NM$ 个 $\delta\mu$、
+ $NM$ 个空间松弛和 $N(M-1)$ 个顺序松弛；
+ \item 定义 \texttt{lambda\_index(k,j)}、\texttt{mu\_index(k,j)} 等索引；
+ \item 向 Hessian/梯度加入进度正则和松弛罚项；
+ \item 向稀疏 Triplet 约束加入上述递推和 CSTC 仿射行；
+ \item 更新名义进度并检查原始乘积残差；
+ \item 在结果中记录航点时间、空间残差、顺序残差和 CSTC 收敛标志。
+\end{enumerate}
+旧变量数和新增变量数约为
+\[
+ n_{\rm old}=9(N+1)+4N+9N,\qquad
+ n_{\rm add}=(N+1)M+NM+NM+N(M-1).
+\]
+航点较少时仍适合稀疏 OSQP，但计算量会高于固定节点版本。
+
+\section{YAML 配置、RViz 回放与推力箭头}
+
+航点由 \texttt{config/gpttraj.yaml} 配置。由于 ROS~2 参数不支持通用二维
+数值数组，坐标采用四个等长数组：
+\begin{align}
+ M&=\texttt{waypoint\_count},\\
+ p_{j,x}^w&=\texttt{waypoint\_x}[j],\quad
+ p_{j,y}^w=\texttt{waypoint\_y}[j],\\
+ p_{j,z}^w&=\texttt{waypoint\_z}[j],\quad
+ r_j=\texttt{waypoint\_tolerance}[j].
+\end{align}
+节点启动时严格检查四个数组长度都等于 $M$。每轮接受的 SCP 名义轨迹都记录
+到结果对象的 \texttt{history} 字段，可视化节点按时间顺序发布
+\texttt{MarkerArray}，因此 RViz 中的折线展示了求解过程的逐轮变化。
+
+第 $k$ 个推力箭头的起点和终点分别为
+\begin{align}
+ \bm a_k^{\rm start}&=\bm p_k,\\
+ \bm a_k^{\rm end}&=\bm p_k+s_T a_{T,k}\bm R_k\bm e_3,
+\end{align}
+其中 $s_T=\texttt{thrust\_arrow\_scale}$。所以箭头方向严格为机体 $+Z$
+在 ENU 系中的方向，长度 $\ell_k=s_Ta_{T,k}$ 与推力加速度成正比。配置中的
+\texttt{thrust\_arrow\_stride} 只控制抽样密度，不改变优化结果。
+
+\section{结论}
+
+\begin{enumerate}
+ \item 旧固定节点方法没有丢失航点约束，但会预先固定经过时刻。
+ \item 当前实现加入进度递推和 $\mu_k^j g_k^j\leq0$，经过节点由优化器选择，
+ 且可以严格证明每个航点至少被经过一次。
+ \item 当前实现的 $\lambda_k^j\mu_k^{j+1}=0$ 可保证严格的先后顺序。
+ \item 两类乘积经 SCP 一阶展开后是仿射约束，能够继续使用 Eigen+OSQP。
+ \item 最终保证必须以原始非线性互补残差、动力学缺陷和松弛量均合格为条件。
+\end{enumerate}
+
+\end{document}

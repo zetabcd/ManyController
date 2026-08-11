@@ -1,0 +1,1080 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{enumitem,geometry,xcolor,hyperref}
+\usepackage{listings}
+
+\geometry{left=22mm,right=22mm,top=23mm,bottom=24mm}
+\hypersetup{colorlinks=true,linkcolor=blue!55!black,urlcolor=blue!55!black}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.25em}
+\setlength{\emergencystretch}{4em}
+\renewcommand{\arraystretch}{1.25}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\SO}{\mathrm{SO}(3)}
+\newcommand{\ee}{\bm e_3}
+\newcommand{\trans}{^{\mathsf T}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\normtwo}[1]{\left\lVert #1\right\rVert_2}
+\newcommand{\norminf}[1]{\left\lVert #1\right\rVert_\infty}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\Exp}{\operatorname{Exp}}
+\newcommand{\Log}{\operatorname{Log}}
+\newcommand{\clip}{\operatorname{clip}}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false
+}
+
+\title{四旋翼最短时间航点轨迹优化与流形 MPC\\
+当前工程实现、数学推导、数据流和代码逐项对应}
+\author{对应 \code{gpttraj.cpp/.h}、\code{gptmpc.cpp/.h} 与可视化节点}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{文档范围与当前实现结论}
+
+本文严格描述当前工程中的四个核心文件：
+\begin{itemize}[leftmargin=2em]
+  \item \code{include/px4ctrl/gpttraj.h}：离线轨迹优化输入、输出和配置结构；
+  \item \code{src/gpttraj.cpp}：流形动力学、CSTC、SCP、OSQP 和最短时间二分；
+  \item \code{include/px4ctrl/gptmpc.h}：在线 MPC 接口、权重和诊断结构；
+  \item \code{src/gptmpc.cpp}：轨迹采样、预测模型、凝聚 QP 与控制输出。
+\end{itemize}
+同时说明
+\code{gpttraj_visualizer_node.cpp} 和
+\code{config/gpttraj.yaml} 的数据输入、日志和 RViz 输出。
+
+当前默认算法不是把时间、平滑性和能量混合成一个加权性能指标，而是采用
+\emph{字典序}结构：
+\begin{equation}
+  \boxed{
+  T^\star=\inf\{T\mid \mathcal F(T)\neq\varnothing\}
+  }
+  \label{eq:outer-min-time}
+\end{equation}
+其中 $\mathcal F(T)$ 是固定总时间 $T$ 时，由动力学、边界条件、控制输入边界和
+有序航点约束定义的可行集。外层只最小化 $T$；固定 $T$ 的内层代价只用于找到
+可行点和稳定数值迭代，因此不能用更长时间换取更平滑的控制。
+
+默认实现分成两个航点阶段：
+\begin{enumerate}[leftmargin=2.2em]
+  \item 用完整 $\lambda_k^j,\mu_k^j$ CSTC 识别每个航点的通过活跃节点；
+  \item 锁定该互补活跃集，在外层时间二分中把相应航点球作为硬约束。
+\end{enumerate}
+第二步解决了高维 CSTC 在每次时间试验中反复切换活跃集所造成的假不可行。
+因此当前结果是\emph{已识别 CSTC 活跃集下的最短时间解}，而不是对所有可能
+互补活跃集的全局最优证明。
+
+\section{坐标系、状态和控制输入}
+
+\subsection{坐标约定}
+
+轨迹优化器内部采用工程的 ENU 世界坐标系：
+\begin{itemize}[leftmargin=2em]
+  \item $\bm p,\bm v\in\R^3$ 在 ENU 世界系表达；
+  \item $\bm R\in\SO$ 把机体 FLU 向量变换到 ENU；
+  \item $\ee=[0,0,1]\trans$；
+  \item 机体 $+Z$ 轴在世界系中的方向为 $\bm R\ee$。
+\end{itemize}
+
+\subsection{优化状态和底层输入}
+
+连续状态为
+\begin{equation}
+  \bm x=(\bm p,\bm v,\bm R)
+  \in \R^3\times\R^3\times\SO .
+  \label{eq:state}
+\end{equation}
+控制输入为
+\begin{equation}
+  \boxed{
+  \bm u=
+  \begin{bmatrix}
+    a_T & \omega_x & \omega_y & \omega_z
+  \end{bmatrix}\trans
+  }
+  \label{eq:input}
+\end{equation}
+其中 $a_T$ 是质量归一化总拉力，单位为 $\mathrm{m/s^2}$，方向沿机体 $+Z$；
+$\bm\omega$ 是机体系角速度，单位为 $\mathrm{rad/s}$。
+
+该输入与工程底层接口直接对应。轨迹优化输出 $a_T$，在线控制器最终转换成
+牛顿单位总拉力：
+\begin{equation}
+  f_T=m a_T .
+  \label{eq:thrust-conversion}
+\end{equation}
+角速度则直接写入 \code{control_setpoint.bodyrates}。
+
+\section{数据输入、处理和输出总流程}
+
+\subsection{配置输入}
+
+ROS~2 配置文件采用
+\begin{lstlisting}
+waypoint_count: M
+waypoints:
+  point_0: [x0, y0, z0]
+  ...
+  point_(M-1): [xM, yM, zM]
+\end{lstlisting}
+每个航点是一组完整的 $[x,y,z]$。因为 ROS~2 参数不支持一般的二维数值数组，
+代码用 \code{waypoints.point_j} 的命名向量表达多点输入。
+
+输入还包括：
+\begin{itemize}[leftmargin=2em]
+  \item 初始和终端位置、速度、偏航；
+  \item 推力上下限和三个角速度上限；
+  \item 时间上下限、二分容差、离散段数 $N$；
+  \item SCP 信赖域、可行性容差和 CSTC 参数；
+  \item RViz 显示频率、最终显示采样数和箭头比例。
+\end{itemize}
+
+\subsection{完整数据流}
+
+\begin{enumerate}[leftmargin=2.4em]
+  \item 可视化节点读取 YAML，构造
+  \code{GptTrajectoryBoundary}、\code{GptTrajectoryWaypoint} 和
+  \code{GptTrajectoryOptions}。
+  \item \code{GptTrajectoryOptimizer::optimize()} 检查有限数值、航点数量和容差。
+  \item 用初点、航点和终点的折线生成几何初值。
+  \item 在候选时间下运行固定时间 SCP/OSQP，首先识别 CSTC 活跃节点。
+  \item 保存非线性可行 incumbent 以及完整 $\lambda,\mu$。
+  \item 外层对总时间进行二分；时间压缩试验使用上一条可行轨迹热启动。
+  \item 输出 \code{GptTrajectoryResult}：总时间、状态序列、航点时刻、残差和日志历史。
+  \item RViz 将最终结果重采样成高密度红色曲线和黑色推力箭头。
+  \item \code{GptMpcControl} 按控制周期从轨迹连续采样参考，求解在线 QP。
+  \item 在线输出牛顿总拉力、机体角速度和期望姿态。
+\end{enumerate}
+
+\section{四旋翼动力学模型}
+
+\subsection{连续时间模型}
+
+代码使用以总拉力加速度和角速度为输入的降阶四旋翼模型：
+\begin{subequations}
+\label{eq:continuous-dynamics}
+\begin{align}
+  \dot{\bm p} &= \bm v, \\
+  \dot{\bm v} &= -g\ee+a_T\bm R\ee, \\
+  \dot{\bm R} &= \bm R[\bm\omega]_\times .
+\end{align}
+\end{subequations}
+反对称矩阵定义为
+\begin{equation}
+  [\bm a]_\times\bm b=\bm a\times\bm b .
+  \label{eq:hat}
+\end{equation}
+对应代码是两个文件中的 \code{hat()}、\code{expSo3()} 和
+\code{logSo3()}。
+
+模型没有显式包含电机转速、转动惯量和力矩动力学，因为这里假定下一级角速度环
+能够跟踪 $\bm\omega$ 指令。若需要描述电机带宽，应开启输入变化率约束，或者把
+电机/角速度环状态加入模型。
+
+\subsection{离散动力学}
+
+设总时间为 $T$，离散段数为 $N$：
+\begin{equation}
+  \Delta t=\frac{T}{N}.
+  \label{eq:dt}
+\end{equation}
+零阶保持与前向欧拉离散为
+\begin{subequations}
+\label{eq:discrete-dynamics}
+\begin{align}
+  \bm p_{k+1} &= \bm p_k+\Delta t\,\bm v_k, \\
+  \bm v_{k+1} &= \bm v_k+
+  \Delta t\left(-g\ee+a_{T,k}\bm R_k\ee\right), \\
+  \bm R_{k+1} &= \bm R_k\Exp(\Delta t\,\bm\omega_k).
+\end{align}
+\end{subequations}
+该公式一对一对应 \code{gpttraj.cpp::propagate()} 和
+\code{gptmpc.cpp::linearizeStep()} 内部的传播表达式。
+
+\subsection{$\SO$ 上的局部误差}
+
+名义状态为 $\bar{\bm x}=(\bar{\bm p},\bar{\bm v},\bar{\bm R})$。
+代码不用九个矩阵元素直接优化姿态，而使用三维李代数误差：
+\begin{equation}
+  \delta\bm x=
+  \begin{bmatrix}
+    \bm p-\bar{\bm p}\\
+    \bm v-\bar{\bm v}\\
+    \Log(\bar{\bm R}\trans\bm R)
+  \end{bmatrix}
+  \in\R^9 .
+  \label{eq:local-error}
+\end{equation}
+求得姿态增量 $\delta\bm\theta$ 后，通过
+\begin{equation}
+  \bm R^+=\bar{\bm R}\Exp(\delta\bm\theta)
+  \label{eq:attitude-retraction}
+\end{equation}
+回缩到 $\SO$。对应 \code{difference()} 和接受 SCP 解时的
+\code{states[k].r = states[k].r * expSo3(...)}。
+
+\section{轨迹优化的原始最短时间问题}
+
+理想非线性问题为
+\begin{equation}
+\begin{aligned}
+  \min_{T,\{\bm x_k,\bm u_k\}}\quad & T \\
+  \text{s.t.}\quad
+  & \bm x_{k+1}=f_d(\bm x_k,\bm u_k,T/N), \\
+  & \bm x_0=\bm x_{\mathrm{init}},\qquad
+    \bm x_N=\bm x_{\mathrm{terminal}}, \\
+  & a_{T,\min}\leq a_{T,k}\leq a_{T,\max}, \\
+  & |\omega_{i,k}|\leq\omega_{i,\max}, \\
+  & \text{依次进入所有航点球}, \\
+  & T_{\min}\leq T\leq T_{\max}.
+\end{aligned}
+\label{eq:original-problem}
+\end{equation}
+默认没有速度上限、倾角上限、能量代价或轨迹平滑性能指标。因此，当最短时间边界
+由推力决定时，最优解应主动接近 $a_{T,\max}$；当前验证结果中推力利用率达到
+$100\%$。
+
+\section{固定时间 SCP 子问题}
+
+\subsection{动力学线性化}
+
+固定 $T$ 后，在名义轨迹
+$(\bar{\bm x}_k,\bar{\bm u}_k)$ 附近对离散动力学残差数值差分：
+\begin{equation}
+  \delta\bm x_{k+1}
+  =
+  \bm A_k\delta\bm x_k+
+  \bm B_k\delta\bm u_k
+  -\bm d_k+\bm\nu_k .
+  \label{eq:linear-dynamics}
+\end{equation}
+其中
+\begin{align}
+  \bm A_k&=\frac{\partial f_d}{\partial\bm x},&
+  \bm B_k&=\frac{\partial f_d}{\partial\bm u},&
+  \bm d_k&=\text{当前非线性离散缺陷}.
+\end{align}
+$\bm\nu_k\in\R^9$ 是虚拟控制，用于避免早期线性化 QP 无解；它受到高权重惩罚，
+且最终必须低于动力学容差。对应 \code{linearize()} 和动力学等式行的 Triplet 组装。
+
+\subsection{决策向量}
+
+在完整 CSTC 识别阶段，单轮 QP 的决策变量为
+\begin{equation}
+\bm z=
+\begin{bmatrix}
+  \delta\bm x_{0:N}\\
+  \delta\bm u_{0:N-1}\\
+  \bm\nu_{0:N-1}\\
+  \delta\bm\lambda\\
+  \delta\bm\mu\\
+  \bm s^{\mathrm{wp}}\\
+  \bm s^{\mathrm{ord}}
+\end{bmatrix}.
+\label{eq:decision-cstc}
+\end{equation}
+各部分维数为
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+变量 & 维数 & 作用\\
+\midrule
+$\delta\bm x$ & $9(N+1)$ & 位置、速度、姿态局部增量\\
+$\delta\bm u$ & $4N$ & 推力加速度和角速度增量\\
+$\bm\nu$ & $9N$ & 动力学虚拟控制\\
+$\delta\bm\lambda$ & $(N+1)M$ & 航点剩余进度增量\\
+$\delta\bm\mu$ & $NM$ & 航点进度消耗增量\\
+$\bm s^{\mathrm{wp}}$ & $NM$ & 空间 CSTC 非负松弛\\
+$\bm s^{\mathrm{ord}}$ & $N(M-1)$ & 严格次序非负松弛\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+活跃集锁定后的时间二分阶段不再把 $\lambda,\mu$ 和 CSTC 松弛放入 QP，决策向量缩减为
+\begin{equation}
+  \bm z_{\mathrm{active}}=
+  [\delta\bm x_{0:N},\delta\bm u_{0:N-1},\bm\nu_{0:N-1}]\trans .
+  \label{eq:decision-active}
+\end{equation}
+
+\subsection{内层目标函数的正确含义}
+
+固定 $T$ 的 OSQP 目标写成
+\begin{equation}
+\begin{aligned}
+J_{\mathrm{inner}}={}&
+\rho_x\sum_k\normtwo{\delta\bm x_k}^2+
+\rho_u\sum_k\normtwo{\bar{\bm u}_k+\delta\bm u_k-\bm u_h}^2\\
+&+\rho_{\Delta u}\sum_{k=1}^{N-1}
+\normtwo{
+(\bar{\bm u}_k+\delta\bm u_k)-
+(\bar{\bm u}_{k-1}+\delta\bm u_{k-1})
+}^2\\
+&+\rho_\nu\sum_k\normtwo{\bm\nu_k}^2+
+\rho_\mu\sum_{k,j}(\delta\mu_k^j)^2\\
+&+\rho_s\sum_{k,j}
+\left(s_{k,j}^{\mathrm{wp}}+s_{k,j}^{\mathrm{ord}}\right),
+\end{aligned}
+\label{eq:inner-cost}
+\end{equation}
+其中
+\begin{equation}
+  \bm u_h=[g,0,0,0]\trans .
+\end{equation}
+
+式~\eqref{eq:inner-cost} 不含 $T$，因为 $T$ 在单次内层问题中是常数。它只在同一个
+$T$ 的可行集合内选择数值较稳定的解。外层若判定更短的 $T$ 可行，就必然选择更短
+时间，不会因为式~\eqref{eq:inner-cost} 更小而保留较长时间。这正是字典序结构与
+原先联合加权目标的本质区别。
+
+展开式~\eqref{eq:inner-cost} 后得到 OSQP 标准二次目标：
+\begin{equation}
+  \min_{\bm z}\quad
+  \frac12\bm z\trans\bm P\bm z+\bm q\trans\bm z .
+  \label{eq:osqp-objective}
+\end{equation}
+对应代码中的 \code{h_triplets} 和 \code{gradient}。
+
+\section{边界、输入与信赖域约束}
+
+\subsection{初末状态}
+
+初始状态增量固定为零：
+\begin{equation}
+  \delta\bm x_0=\bm 0.
+  \label{eq:initial-boundary}
+\end{equation}
+终端增量消除名义终端状态与目标终端状态之间的误差：
+\begin{equation}
+  \delta\bm x_N=
+  \begin{bmatrix}
+  \bm p_f-\bar{\bm p}_N\\
+  \bm v_f-\bar{\bm v}_N\\
+  \Log(\bar{\bm R}_N\trans\bm R_f)
+  \end{bmatrix}.
+  \label{eq:terminal-boundary}
+\end{equation}
+
+\subsection{真实控制输入边界}
+
+QP 变量是控制增量，但约束施加在更新后的真实控制上：
+\begin{subequations}
+\label{eq:input-bounds}
+\begin{align}
+  a_{T,\min}-\bar a_{T,k}
+  &\leq\delta a_{T,k}
+  \leq a_{T,\max}-\bar a_{T,k},\\
+  -\bm\omega_{\max}-\bar{\bm\omega}_k
+  &\leq\delta\bm\omega_k
+  \leq\bm\omega_{\max}-\bar{\bm\omega}_k.
+\end{align}
+\end{subequations}
+默认值为
+\[
+  a_{T,\max}=39.22\ \mathrm{m/s^2},\qquad
+  \bm\omega_{\max}=[14,14,14]\trans\ \mathrm{rad/s}.
+\]
+
+\subsection{可选输入变化率约束}
+
+若配置开启，可加入
+\begin{equation}
+  |u_{k,i}-u_{k-1,i}|\leq \dot u_{i,\max}\Delta t .
+  \label{eq:input-rate}
+\end{equation}
+还可约束首末输入从悬停输入按同一变化率进入和退出。当前默认关闭这两类约束，
+所以最终轨迹可能具有很大的 $\dot a_T$ 和 $\dot{\bm\omega}$；这符合论文层级
+$[a_T,\bm\omega]$ 直接作为输入的模型，但真实飞行前必须确认底层执行器带宽。
+
+\subsection{SCP 信赖域}
+
+每轮局部增量满足
+\begin{subequations}
+\label{eq:trust-regions}
+\begin{align}
+  \norminf{\delta\bm p_k}&\leq r_p,\\
+  \norminf{\delta\bm v_k}&\leq r_v,\\
+  \norminf{\delta\bm\theta_k}&\leq r_R.
+\end{align}
+\end{subequations}
+默认 $r_p=1$、$r_v=3$、$r_R=0.7$。这些是 SCP 局部模型有效性的数值约束，
+不是最终轨迹的物理位置、速度或倾角上限。
+
+\section{CSTC 航点和顺序约束}
+
+\subsection{进度变量}
+
+对第 $j$ 个航点，引入
+\begin{itemize}[leftmargin=2em]
+  \item $\lambda_k^j\in[0,1]$：节点 $k$ 时尚未完成的剩余进度；
+  \item $\mu_k^j\in[0,1]$：区间 $k$ 消耗的进度。
+\end{itemize}
+递推为
+\begin{equation}
+  \lambda_{k+1}^j=\lambda_k^j-\mu_k^j,
+  \label{eq:progress-dynamics}
+\end{equation}
+边界为
+\begin{equation}
+  \lambda_0^j=1,\qquad \lambda_N^j=0.
+  \label{eq:progress-boundary}
+\end{equation}
+因此
+\begin{equation}
+  \sum_{k=0}^{N-1}\mu_k^j=1.
+  \label{eq:mu-sum}
+\end{equation}
+
+\subsection{航点空间互补}
+
+第 $j$ 个航点球定义为
+\begin{equation}
+  h_k^j=\normtwo{\bm p_k-\bm p_j^{\mathrm{wp}}}^2-r_j^2.
+  \label{eq:waypoint-function}
+\end{equation}
+CSTC 条件为
+\begin{equation}
+  \mu_k^j h_k^j\leq0.
+  \label{eq:spatial-cstc}
+\end{equation}
+因为 $\mu_k^j\geq0$，当 $\mu_k^j>0$ 时，必须有 $h_k^j\leq0$，即飞机进入航点球。
+
+在名义点 $(\bar\mu_k^j,\bar{\bm p}_k)$ 对乘积一阶展开：
+\begin{equation}
+\begin{aligned}
+&\bar\mu_k^j\bar h_k^j
++\bar h_k^j\delta\mu_k^j
++2\bar\mu_k^j
+(\bar{\bm p}_k-\bm p_j^{\mathrm{wp}})\trans\delta\bm p_k
+-s_{k,j}^{\mathrm{wp}}
+\leq0 ,
+\end{aligned}
+\label{eq:linear-spatial-cstc}
+\end{equation}
+其中 $s_{k,j}^{\mathrm{wp}}\geq0$。该式直接对应
+\code{waypoint_cstc_rows} 的稀疏矩阵行。
+
+\subsection{航点顺序}
+
+弱顺序约束为
+\begin{equation}
+  \lambda_k^j\leq\lambda_k^{j+1}.
+  \label{eq:weak-order}
+\end{equation}
+它表示前一个航点的剩余进度不能大于后一个航点，从而避免完成顺序逆转。
+
+严格顺序互补为
+\begin{equation}
+  \lambda_k^j\mu_k^{j+1}=0.
+  \label{eq:strict-order}
+\end{equation}
+当前一航点仍未完成，即 $\lambda_k^j>0$ 时，后一个航点不能开始消耗进度。
+一阶展开为
+\begin{equation}
+  \bar\mu_k^{j+1}\delta\lambda_k^j+
+  \bar\lambda_k^j\delta\mu_k^{j+1}+
+  \bar\lambda_k^j\bar\mu_k^{j+1}
+  -s_{k,j}^{\mathrm{ord}}\leq0 .
+  \label{eq:linear-strict-order}
+\end{equation}
+
+\subsection{航点时刻恢复}
+
+完整 CSTC 阶段通过 $\mu$ 的重心恢复航点时刻：
+\begin{equation}
+  t_j=\frac{T}{N}
+  \sum_{k=0}^{N-1}k\mu_k^j.
+  \label{eq:waypoint-time}
+\end{equation}
+代码同时保存完整 \code{progress_lambda} 和 \code{progress_mu}，
+避免只保存重心后丢失进度分布。
+
+\subsection{活跃集锁定}
+
+完整 CSTC 得到可行解后，以式~\eqref{eq:waypoint-time} 对应的离散节点作为
+互补活跃节点。在后续时间二分中固定该节点，并施加分量约束
+\begin{equation}
+  |p_{k_j,i}-p_{j,i}^{\mathrm{wp}}|
+  \leq\frac{r_j}{\sqrt3},\qquad i\in\{x,y,z\}.
+  \label{eq:fixed-waypoint-box}
+\end{equation}
+由
+\[
+  \sum_i(p_{k_j,i}-p_{j,i}^{\mathrm{wp}})^2
+  \leq3\left(\frac{r_j}{\sqrt3}\right)^2=r_j^2
+\]
+可知式~\eqref{eq:fixed-waypoint-box} 是原航点球的内接立方体约束，因此严格保证
+进入航点球。它比球约束略保守，但保持 QP 线性，并消除了互补模式切换。
+
+\section{初值、热启动和最短时间二分}
+
+\subsection{几何初值}
+
+设初点、全部航点和终点的折线长度为 $L$。初始候选时间为
+\begin{equation}
+  T_0=
+  \clip\left(
+  \frac{1.5L}{v_{\mathrm{init}}},
+  T_{\min},T_{\max}
+  \right).
+  \label{eq:initial-time}
+\end{equation}
+位置按折线累计弧长均匀布点，速度由中心差分初始化。姿态的机体 $Z$ 轴与
+所需合力方向一致：
+\begin{equation}
+  \bm z_{b,k}=
+  \frac{\bm a_k+g\ee}{\normtwo{\bm a_k+g\ee}}.
+  \label{eq:force-attitude}
+\end{equation}
+初始推力与角速度为
+\begin{subequations}
+\begin{align}
+  a_{T,k}&=(\bm a_k+g\ee)\trans\bm R_k\ee,\\
+  \bm\omega_k&=
+  \frac{1}{\Delta t}\Log(\bm R_k\trans\bm R_{k+1}).
+\end{align}
+\label{eq:initial-input}
+\end{subequations}
+
+\subsection{初始恢复锚点}
+
+为了稳定第一条 CSTC 可行种子，代码可在\emph{仅初始恢复阶段}临时使用输入变化率
+和首尾悬停输入锚点。该锚点在所有最短时间试验中关闭，除非用户在配置中显式开启；
+因此它不会缩小最终最短时间问题的可行集。
+
+\subsection{时间缩放热启动}
+
+若已有总时间 $T_{mathrm{old}}$ 的可行轨迹，测试较短时间
+$T_{mathrm{new}}$ 时保持归一化路径参数 $s=t/T$：
+\begin{equation}
+  \bm p_{\mathrm{new}}(s)=\bm p_{\mathrm{old}}(s).
+  \label{eq:warm-position}
+\end{equation}
+令
+\begin{equation}
+  \alpha=\frac{T_{\mathrm{old}}}{T_{\mathrm{new}}},
+\end{equation}
+则速度热启动为
+\begin{equation}
+  \bm v_{\mathrm{new}}(s)=\alpha\bm v_{\mathrm{old}}(s).
+  \label{eq:warm-velocity}
+\end{equation}
+姿态与输入根据缩放后的加速度重新构造，以正确处理重力项。完整 $\lambda,\mu$
+或已识别的活跃节点沿归一化时间保持。
+
+\subsection{外层二分}
+
+首先扩大候选时间直到获得可行上界 $T_F$：
+\begin{equation}
+  T\leftarrow\min(1.35T,T_{\max}).
+  \label{eq:expand-time}
+\end{equation}
+随后测试 $T_{\min}$。若不可行，设置
+\[
+  T_I=T_{\min},\qquad T_F=T_{\mathrm{current}},
+\]
+并迭代
+\begin{equation}
+  T_{\mathrm{trial}}=\frac{T_I+T_F}{2}.
+  \label{eq:bisection-trial}
+\end{equation}
+若固定时间问题可行，则
+\[
+  T_F\leftarrow T_{\mathrm{trial}};
+\]
+否则
+\[
+  T_I\leftarrow T_{\mathrm{trial}}.
+\]
+当
+\begin{equation}
+  T_F-T_I\leq\varepsilon_T
+  \label{eq:bisection-stop}
+\end{equation}
+或达到最大搜索次数时，返回最短已知可行上界 $T_F$。
+
+\section{可行性判据与 incumbent}
+
+每轮接受更新后，代码重新用非线性传播式~\eqref{eq:discrete-dynamics} 计算真实残差。
+固定时间轨迹被判为可行需要
+\begin{subequations}
+\label{eq:feasibility-tests}
+\begin{align}
+  \max_k\norminf{\bm\nu_k}&<\varepsilon_{\mathrm{dyn}},\\
+  \max_k\norminf{
+  f_d(\bm x_k,\bm u_k,\Delta t)-\bm x_{k+1}}
+  &<\varepsilon_{\mathrm{dyn}},\\
+  r_{\mathrm{wp}}&<\varepsilon_{\mathrm{CSTC}},\\
+  r_{\mathrm{ord}}&<\varepsilon_{\mathrm{CSTC}},\\
+  s_{\max}&<\varepsilon_{\mathrm{slack}}.
+\end{align}
+\end{subequations}
+
+只要某一轮满足式~\eqref{eq:feasibility-tests}，就保存为可行 incumbent。相同 $T$ 下，
+代码用归一化残差 merit 选择更好的可行迭代，而不是像旧实现一样永远返回第一个
+可行迭代。
+
+\code{success=true} 表示式~\eqref{eq:feasibility-tests} 成立。
+\code{converged=true} 还要求
+\begin{equation}
+  \norminf{\Delta\bm z}\leq\varepsilon_{\mathrm{update}}.
+  \label{eq:scp-convergence}
+\end{equation}
+因此 \code{success=true, converged=false} 表示已经有约束可行轨迹，但尚未证明
+SCP 驻点收敛；\code{Optimization failed} 则表示没有任何迭代满足可行性阈值。
+
+\section{OSQP 与 Eigen 的矩阵构造}
+
+OSQP 接收
+\begin{equation}
+\begin{aligned}
+  \min_{\bm z}\quad&
+  \frac12\bm z\trans\bm P\bm z+\bm q\trans\bm z,\\
+  \text{s.t.}\quad&
+  \bm l\leq\bm A\bm z\leq\bm u.
+\end{aligned}
+\label{eq:osqp-standard}
+\end{equation}
+
+轨迹优化中的约束行按如下顺序组装：
+\begin{enumerate}[leftmargin=2.4em]
+  \item 初始状态和终端状态等式；
+  \item $N$ 段线性化动力学等式；
+  \item CSTC 进度递推与进度边界；
+  \item 弱顺序、空间 CSTC 和严格顺序；
+  \item 或者锁定活跃集后的固定航点分量约束；
+  \item 可选输入变化率约束；
+  \item 单位矩阵行：信赖域、控制边界、进度边界和松弛非负性。
+\end{enumerate}
+
+代码用 \code{Eigen::Triplet<double>} 累积非零元素，然后构造
+\code{Eigen::SparseMatrix<double>}。\code{toCsc()} 把矩阵压缩成 CSC：
+\begin{itemize}[leftmargin=2em]
+  \item $\bm P$ 只传上三角；
+  \item $\bm A$ 传完整稀疏矩阵；
+  \item $\bm q,\bm l,\bm u$ 从 Eigen 连续内存复制到 OSQP 数组；
+  \item OSQP 解再复制回 \code{Eigen::VectorXd}。
+\end{itemize}
+
+轨迹优化 OSQP 默认最大迭代数为 $50000$，绝对和相对容差均为
+$5\times10^{-5}$，并开启 polishing。
+
+\section{轨迹结果、连续采样与 RViz}
+
+\subsection{轨迹输出}
+
+\code{GptTrajectoryResult} 输出：
+\begin{itemize}[leftmargin=2em]
+  \item \code{success}、\code{converged} 和文字状态；
+  \item 总时间 $T$、SCP 次数和总求解时间；
+  \item $N+1$ 个 \code{GptTrajectoryState}；
+  \item 每个航点的选定时刻；
+  \item 完整 $\lambda,\mu$；
+  \item 动力学、虚拟控制、航点、顺序和松弛残差；
+  \item 所有接受的 SCP 历史帧。
+\end{itemize}
+
+\subsection{连续采样}
+
+对 $t_k\leq t<t_{k+1}$，定义
+\begin{equation}
+  \beta=\frac{t-t_k}{t_{k+1}-t_k}.
+\end{equation}
+位置、速度、推力和角速度线性插值：
+\begin{equation}
+  \bm y(t)=(1-\beta)\bm y_k+\beta\bm y_{k+1}.
+  \label{eq:linear-sample}
+\end{equation}
+姿态使用四元数最短路径 SLERP：
+\begin{equation}
+  \bm q(t)=\operatorname{SLERP}(\bm q_k,\bm q_{k+1},\beta).
+  \label{eq:slerp}
+\end{equation}
+对应 \code{GptTrajectoryOptimizer::sample()}。MPC 因此按控制周期采样，不受优化网格
+$N=60$ 的 $12.4\,\mathrm{Hz}$ 节点频率限制。
+
+\subsection{可视化数据处理}
+
+橙色曲线直接显示每一轮 SCP 的优化节点。最终红色轨迹独立重采样为默认
+$240$ 段、$241$ 个显示状态；该操作不增加 OSQP 决策变量。
+
+每个黑色箭头起点为 $\bm p_k$，终点为
+\begin{equation}
+  \bm p_k^{\mathrm{arrow}}=
+  \bm p_k+c_f a_{T,k}\bm R_k\ee,
+  \qquad c_f=0.03.
+  \label{eq:arrow}
+\end{equation}
+因此箭头方向是机体 $Z$ 轴/推力方向，长度与 $a_T$ 成正比。比例从 $0.06$ 改为
+$0.03$ 后，所有箭头等比例缩短一半，相对大小保持不变。
+
+蓝色长方体使用 \code{sample()} 沿最终轨迹循环，姿态来自轨迹四元数，移动速度由
+轨迹时间和 \code{vehicle_playback_speed} 决定。
+
+\section{在线流形 MPC}
+
+\subsection{参考轨迹输入}
+
+若调用 \code{setTrajectory()}，在线时刻 $t$ 和预测步 $k$ 的参考为
+\begin{equation}
+  \bm r_k=\operatorname{sample}
+  \left(\text{trajectory},t+k\Delta t_{\mathrm{MPC}}\right).
+  \label{eq:mpc-reference}
+\end{equation}
+若没有完整轨迹但提供 preview，则直接使用 preview；否则根据
+\code{Ref_State_t} 的位置、速度、加速度和 jerk 构造动态一致参考。
+
+\subsection{MPC 误差状态}
+
+当前状态相对第一个参考的误差为
+\begin{equation}
+  \bm e_0=
+  \begin{bmatrix}
+  \bm p-\bm p_0^d\\
+  \bm v-\bm v_0^d\\
+  \Log((\bm R_0^d)\trans\bm R)
+  \end{bmatrix}\in\R^9.
+  \label{eq:mpc-error}
+\end{equation}
+控制增量为
+\begin{equation}
+  \delta\bm u_k=
+  \bm u_k-\bm u_k^d\in\R^4.
+\end{equation}
+
+在每个参考点数值线性化：
+\begin{equation}
+  \bm e_{k+1}=
+  \bm A_k\bm e_k+
+  \bm B_k\delta\bm u_k+
+  \bm c_k.
+  \label{eq:mpc-linear}
+\end{equation}
+
+\subsection{预测模型凝聚}
+
+堆叠未来误差
+\[
+  \bm E=[\bm e_1\trans,\ldots,\bm e_H\trans]\trans
+\]
+和控制增量
+\[
+  \Delta\bm U=[
+  \delta\bm u_0\trans,\ldots,\delta\bm u_{H-1}\trans]\trans .
+\]
+递推式~\eqref{eq:mpc-linear} 得到
+\begin{equation}
+  \bm E=
+  \bm S_x\bm e_0+
+  \bm S_u\Delta\bm U+
+  \bm c.
+  \label{eq:condensed-prediction}
+\end{equation}
+对应代码中的 \code{sx}、\code{su}、\code{affine}、
+\code{phi} 和 \code{gamma}。
+
+\subsection{MPC 目标和约束}
+
+在线性能指标为
+\begin{equation}
+  J_{\mathrm{MPC}}=
+  \bm E\trans\bar{\bm Q}\bm E+
+  \Delta\bm U\trans\bar{\bm R}\Delta\bm U.
+  \label{eq:mpc-cost}
+\end{equation}
+代入式~\eqref{eq:condensed-prediction}：
+\begin{equation}
+\begin{aligned}
+  \bm P_{\mathrm{MPC}}
+  &=2(\bm S_u\trans\bar{\bm Q}\bm S_u+\bar{\bm R}),\\
+  \bm q_{\mathrm{MPC}}
+  &=2\bm S_u\trans\bar{\bm Q}
+  (\bm S_x\bm e_0+\bm c).
+\end{aligned}
+\label{eq:mpc-pq}
+\end{equation}
+
+输入增量边界保证真实输入满足
+\begin{subequations}
+\begin{align}
+  a_{T,\min}-a_{T,k}^d
+  &\leq\delta a_{T,k}
+  \leq a_{T,\max}-a_{T,k}^d,\\
+  -\bm\omega_{\max}-\bm\omega_k^d
+  &\leq\delta\bm\omega_k
+  \leq\bm\omega_{\max}-\bm\omega_k^d.
+\end{align}
+\label{eq:mpc-bounds}
+\end{subequations}
+约束矩阵是单位矩阵。OSQP 成功后只执行第一步控制：
+\begin{equation}
+  \bm u_{\mathrm{cmd}}=
+  \bm u_0^d+\delta\bm u_0^\star .
+  \label{eq:receding-command}
+\end{equation}
+若 OSQP 失败，则使用上一控制并裁剪推力边界。
+
+\section{算法伪代码}
+
+\subsection{轨迹优化}
+
+\begin{lstlisting}
+Input:
+  initial boundary, terminal boundary
+  ordered waypoint balls
+  thrust/body-rate bounds and numerical options
+
+Validate input
+Build polyline geometric initialization
+T_candidate <- clip(1.5 * path_length / initial_speed)
+
+repeat
+  SolveFixedTime(T_candidate, CSTC enabled, restoration anchor enabled)
+  if feasible: break
+  T_candidate <- min(1.35 * T_candidate, T_max)
+until T_candidate = T_max
+
+if no feasible CSTC seed:
+  return failure
+
+Save CSTC passage active nodes and feasible incumbent
+T_feasible <- T_candidate
+
+Test T_min using time-dilated warm start and locked active nodes
+if T_min feasible:
+  return T_min trajectory
+
+T_infeasible <- T_min
+while T_feasible - T_infeasible > time_search_tolerance:
+  T_trial <- 0.5 * (T_feasible + T_infeasible)
+  trial <- SolveFixedTime(
+      T_trial,
+      warm_start = shortest feasible trajectory,
+      CSTC active nodes locked)
+  if trial feasible:
+    save trial as new incumbent
+    T_feasible <- T_trial
+  else:
+    T_infeasible <- T_trial
+
+return shortest feasible incumbent and final time bracket
+\end{lstlisting}
+
+\subsection{固定时间 SCP}
+
+\begin{lstlisting}
+Initialize states, controls, and optionally lambda/mu
+for SCP iteration = 1 ... max_scp_iterations:
+  Numerically linearize nonlinear dynamics
+  Build sparse Hessian P and gradient q
+  Build boundary, dynamics, waypoint, input, trust-region rows
+  Solve l <= A z <= u with OSQP
+  if OSQP failed:
+    return current fixed-time attempt as failed
+
+  Retract state update onto R^3 x R^3 x SO(3)
+  Update controls and CSTC progress
+  Recompute nonlinear dynamics and CSTC residuals
+  if all nonlinear feasibility tests pass:
+    save or improve feasible incumbent
+  publish iteration timing, residuals, states, and controls
+  if update is small and residuals are feasible:
+    mark converged and stop
+
+return best feasible incumbent, otherwise failure
+\end{lstlisting}
+
+\subsection{在线 MPC}
+
+\begin{lstlisting}
+At every control callback:
+  Sample H+1 references from optimized trajectory
+  Compute current manifold error e0
+  Linearize H reference transitions
+  Condense prediction: E = Sx e0 + Su DeltaU + c
+  Build P = 2(Su' Q Su + R)
+  Build q = 2 Su' Q(Sx e0 + c)
+  Build thrust/body-rate increment bounds
+  Solve the OSQP
+  Apply only u_ref[0] + DeltaU*[0]
+  Convert aT to Newton thrust: fT = mass * aT
+  Publish thrust, body rates, desired attitude, and diagnostics
+\end{lstlisting}
+
+\section{公式与代码一对一对应表}
+
+\begin{longtable}{p{0.10\textwidth}p{0.34\textwidth}p{0.48\textwidth}}
+\toprule
+编号 & 数学内容 & 当前代码位置\\
+\midrule
+\endfirsthead
+\toprule
+编号 & 数学内容 & 当前代码位置\\
+\midrule
+\endhead
+F1 & 反对称矩阵式~\eqref{eq:hat}
+& \code{gpttraj.cpp::hat()}；\code{gptmpc.cpp::hat()}\\
+F2 & $\SO$ 指数、对数与回缩式~\eqref{eq:attitude-retraction}
+& 两文件的 \code{expSo3()}、\code{logSo3()}；SCP 状态更新\\
+F3 & 连续模型式~\eqref{eq:continuous-dynamics}
+& \code{gpttraj.h} 顶部输入说明；两个传播/线性化函数\\
+F4 & 离散模型式~\eqref{eq:discrete-dynamics}
+& \code{gpttraj.cpp::propagate()}\\
+F5 & 局部误差式~\eqref{eq:local-error}
+& \code{gpttraj.cpp::difference()}\\
+F6 & 线性动力学式~\eqref{eq:linear-dynamics}
+& \code{gpttraj.cpp::linearize()} 和 dynamics rows\\
+F7 & 固定时间目标式~\eqref{eq:inner-cost}
+& \code{h_triplets}、\code{gradient} 构造块\\
+F8 & 初末边界式~\eqref{eq:initial-boundary}--\eqref{eq:terminal-boundary}
+& QP 的前 $18$ 个 equality rows\\
+F9 & 控制边界式~\eqref{eq:input-bounds}
+& identity-bound rows 中 input variables 分支\\
+F10 & 可选变化率式~\eqref{eq:input-rate}
+& \code{add_rate_rows()}\\
+F11 & 信赖域式~\eqref{eq:trust-regions}
+& identity-bound rows 中 state variables 分支\\
+F12 & 进度递推式~\eqref{eq:progress-dynamics}、边界式~\eqref{eq:progress-boundary}
+& progress rows 和 progress boundary rows\\
+F13 & 空间 CSTC 式~\eqref{eq:linear-spatial-cstc}
+& waypoint CSTC rows\\
+F14 & 弱顺序式~\eqref{eq:weak-order}
+& weak order rows\\
+F15 & 严格顺序式~\eqref{eq:linear-strict-order}
+& strict order CSTC rows\\
+F16 & 航点时刻式~\eqref{eq:waypoint-time}
+& 填充 \code{result.waypoint_times} 的循环\\
+F17 & 活跃集硬航点式~\eqref{eq:fixed-waypoint-box}
+& \code{fixed_waypoint_rows}\\
+F18 & 热启动式~\eqref{eq:warm-position}--\eqref{eq:warm-velocity}
+& \code{use_warm_start} 分支\\
+F19 & 最短时间式~\eqref{eq:outer-min-time} 与二分式~\eqref{eq:bisection-trial}
+& \code{optimize()} 末尾 minimum-time bisection\\
+F20 & 可行性式~\eqref{eq:feasibility-tests}
+& \code{residuals_feasible} 和 feasible incumbent\\
+F21 & OSQP 标准式~\eqref{eq:osqp-standard}
+& \code{solveOsqp()}、\code{toCsc()}\\
+F22 & 插值式~\eqref{eq:linear-sample} 和 SLERP~\eqref{eq:slerp}
+& \code{GptTrajectoryOptimizer::sample()}\\
+F23 & RViz 箭头式~\eqref{eq:arrow}
+& \code{appendTrajectoryAndThrust()}\\
+M1 & MPC 参考式~\eqref{eq:mpc-reference}
+& \code{GptMpcControl::calculateControl()} 的 trajectory 分支\\
+M2 & MPC 误差式~\eqref{eq:mpc-error}
+& \code{gptmpc.cpp::stateError()}\\
+M3 & MPC 线性化式~\eqref{eq:mpc-linear}
+& \code{gptmpc.cpp::linearizeStep()}\\
+M4 & 凝聚预测式~\eqref{eq:condensed-prediction}
+& \code{sx}、\code{su}、\code{affine} 递推\\
+M5 & MPC 目标式~\eqref{eq:mpc-pq}
+& \code{h_dense} 和 \code{gradient}\\
+M6 & MPC 输入边界式~\eqref{eq:mpc-bounds}
+& \code{lower}、\code{upper} 构造循环\\
+M7 & 滚动控制式~\eqref{eq:receding-command}
+& \code{delta_input.head<4>()} 与控制输出\\
+M8 & 牛顿推力转换式~\eqref{eq:thrust-conversion}
+& \code{control_setpoint.thrust = mass * command(0)}\\
+\bottomrule
+\end{longtable}
+
+\section{默认配置和输出解释}
+
+当前关键默认参数为：
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+参数 & 默认值\\
+\midrule
+优化离散段数 $N$ & $60$\\
+最大 SCP 次数 & $20$\\
+最大时间搜索次数 & $12$\\
+时间二分容差 & $0.02\,\mathrm{s}$\\
+推力加速度范围 & $[0.5,39.22]\,\mathrm{m/s^2}$\\
+角速度范围 & 每轴 $[-14,14],\mathrm{rad/s}$\\
+输入变化率约束 & 关闭\\
+完整 CSTC & 开启\\
+CSTC 活跃集锁定 & 开启\\
+最终显示段数 & $240$\\
+推力箭头比例 $c_f$ & $0.03$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+典型成功日志
+\begin{lstlisting}
+Optimization succeeded (converged=false):
+CSTC-active-set pure-minimum-time bisection,
+bracket=[4.813..., 4.826...] s
+Control-bound utilization: thrust=100.0%, body-rate=85.5%
+\end{lstlisting}
+解释如下：
+\begin{itemize}[leftmargin=2em]
+  \item \code{succeeded}：存在满足当前残差阈值的非线性可行 incumbent；
+  \item \code{converged=false}：SCP 更新范数尚未达到驻点阈值，不能宣称 KKT 收敛；
+  \item \code{bracket}：左端为已知不可行时间，右端为返回的最短已知可行时间；
+  \item 推力利用率 $100\%$：时间目标确实把控制推到物理配置边界；
+  \item MPC 会按控制周期重新采样，并非只按 $N+1$ 个优化节点执行。
+\end{itemize}
+
+\section{功能边界与使用注意事项}
+
+\begin{enumerate}[leftmargin=2.4em]
+  \item \textbf{局部而非全局最优：}
+  SCP 和 CSTC 都是非凸问题的局部方法；活跃集锁定后得到的是所识别通过节点下的
+  最短时间区间，不是所有可能航点时刻的全局证明。
+
+  \item \textbf{输入带宽：}
+  默认只约束 $a_T$ 和 $\bm\omega$ 本身，不约束它们的变化率。当前激进轨迹可能
+  出现很大的 $\dot a_T$ 和 $\dot{\bm\omega}$。真实飞行前应根据实际飞控和电机
+  带宽开启式~\eqref{eq:input-rate}，并重新求解最短时间。
+
+  \item \textbf{降阶模型：}
+  模型假定角速度是可直接跟踪的底层输入，未包含电机和刚体角动量方程。若底层角速度
+  环不足以实现参考，应扩展模型或降低角速度/变化率上限。
+
+  \item \textbf{离散误差：}
+  $N=60$ 是当前五航点配置下兼顾 CSTC 稳定性与计算量的默认值。提高 $N$ 不一定
+  单调改善非凸求解，反而可能导致进度互补振荡。最终应检查非线性动力学残差，并用
+  更高精度传播器离线复核。
+
+  \item \textbf{球与内接盒：}
+  活跃集阶段使用式~\eqref{eq:fixed-waypoint-box}，保证进入原航点球，但比完整球
+  稍保守。若需要消除这部分保守性，可在活跃节点固定后使用二阶锥求解器处理球约束。
+
+  \item \textbf{可视化不等于控制离散：}
+  RViz 的 $241$ 个最终显示点只影响 Marker 密度；MPC 使用连续采样函数和控制周期，
+  两者与轨迹优化决策变量数量相互独立。
+\end{enumerate}
+
+\section{总结}
+
+当前工程形成了完整闭环：
+\[
+\begin{aligned}
+\text{YAML 航点}
+&\rightarrow\text{CSTC 活跃集识别}
+\rightarrow\text{固定时间 SCP/OSQP}\\
+&\rightarrow\text{外层最短时间二分}
+\rightarrow\text{连续轨迹采样}
+\rightarrow\text{流形 MPC}
+\rightarrow[f_T,\bm\omega].
+\end{aligned}
+\]
+轨迹层唯一第一性能指标是总时间；动力学、航点、顺序、输入边界和残差阈值决定
+可行域；内层正则只在固定时间下稳定求解。在线 MPC 再根据实际状态误差对轨迹的
+前馈推力和角速度进行有限时域修正，并保持与工程底层接口一致。
+
+\end{document}

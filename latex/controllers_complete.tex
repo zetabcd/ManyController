@@ -1,0 +1,686 @@
+%% controllers_complete.tex
+%% Music-Drone-225 / many_controller 项目全控制器数学原理与代码实现文档
+%% 编译方式: xelatex controllers_complete.tex
+\documentclass[UTF8, a4paper, 11pt]{ctexart}
+
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{geometry}
+\geometry{left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{orange},
+  breaklines=true, frame=single,
+  language=C++
+}
+
+\newcommand{\SO}{\mathrm{SO}(3)}
+\newcommand{\so}{\mathfrak{so}(3)}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\bu}{\mathbf{u}}
+\newcommand{\bp}{\mathbf{p}}
+\newcommand{\bv}{\mathbf{v}}
+\newcommand{\bq}{\mathbf{q}}
+\newcommand{\bw}{\boldsymbol{\omega}}
+\newcommand{\Log}{\mathrm{Log}}
+\newcommand{\Exp}{\mathrm{Exp}}
+\newcommand{\diag}{\mathrm{diag}}
+\newcommand{\hhat}[1]{\widehat{#1}}
+\newcommand{\norm}[1]{\left\|#1\right\|}
+
+\title{\textbf{Music-Drone-225 飞行控制器\\数学原理与代码实现全解}\\[0.5em]
+       \large many\_controller / px4ctrl 模块}
+\author{自动生成文档}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{系统架构概览}
+%% ============================================================
+
+\subsection{双环解耦架构}
+
+本项目采用外环–内环解耦结构，两个独立 ROS2 节点分别运行：
+
+\begin{itemize}
+  \item \textbf{外环} \texttt{px4ctrl\_node}（200\,Hz）：接收位置/姿态估计，运行飞行状态机与高级控制器，输出期望角速度 $\bw_d$ 和合力 $F_T$（牛顿制）。
+  \item \textbf{内环} \texttt{px4ctrlrate\_node}（400\,Hz）：接收 $(\bw_d, F_T)$，运行角速度 PID 并通过逆矩阵分配法输出四个电机推力指令。
+\end{itemize}
+
+\subsection{控制器后端选择（编译期宏）}
+
+外环控制器通过 \texttt{px4ctrlfsm.h} 中的宏在编译期选择：
+
+\begin{lstlisting}
+#define PX4CTRL_PRIMARY_CONTROLLER 3
+// 0=QuadControl (串级PID)
+// 1=GptMpcControl (SO(3) LTV-MPC, OSQP)
+// 2=SolverNmpc + Ipopt+Eigen 后端
+// 3=SolverNmpc + acados 后端  (当前默认)
+// 4=SolverNmpc + NLopt+Eigen 后端
+// 5=SolverNmpc + Ipopt+CasADi 后端
+\end{lstlisting}
+
+所有控制器共享统一的输入接口（$\bx_{\text{curr}}$，参考轨迹）和输出接口（$\bw_d, F_T$）。
+
+%% ============================================================
+\section{坐标系与符号约定}
+%% ============================================================
+
+\subsection{坐标系定义}
+
+\begin{itemize}
+  \item \textbf{惯性系 $\mathcal{I}$（ENU）}：东-北-天，$z$ 轴朝上，原点固定于地面。
+  \item \textbf{机体系 $\mathcal{B}$}：原点位于质心，$x$ 轴朝前，$z$ 轴朝上（与 NED 相反）。
+  \item \textbf{旋转矩阵 $R \in \SO$}：将机体系向量变换至惯性系，即 $\mathbf{a}_I = R\,\mathbf{a}_B$。
+\end{itemize}
+
+\subsection{符号表}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+符号 & 维度 & 含义 \\
+\midrule
+$\bp \in \R^3$ & 3 & 位置（惯性系，ENU）\\
+$\bv \in \R^3$ & 3 & 速度（惯性系）\\
+$R \in \SO$ & $3\times3$ & 姿态旋转矩阵 \\
+$\bq \in \R^4$ & 4 & 姿态四元数 $(q_w, q_x, q_y, q_z)$\\
+$\bw \in \R^3$ & 3 & 角速度（机体系）\\
+$a_T \in \R$ & 1 & 质量归一化推力加速度 $[\mathrm{m/s^2}]$\\
+$F_T \in \R$ & 1 & 合力（$F_T = m a_T$）$[\mathrm{N}]$\\
+$m$ & — & 无人机质量（0.7311\,kg）\\
+$g$ & — & 重力加速度（9.805\,m/s²）\\
+$\mathbf{e}_3$ & — & 竖直单位向量 $(0,0,1)^T$\\
+$\hhat{\bw}$ & $3\times3$ & $\bw$ 的反对称矩阵（叉乘矩阵）\\
+$\Exp(\boldsymbol{\theta})$ & — & 指数映射 $\SO$，$\theta\to R$\\
+$\Log(R)$ & — & 对数映射 $\SO$，$R\to\boldsymbol{\theta} \in \R^3$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{李群运算}
+
+反对称矩阵：
+\begin{equation}
+  \hhat{\bw} = \begin{pmatrix}0 & -\omega_z & \omega_y \\ \omega_z & 0 & -\omega_x \\ -\omega_y & \omega_x & 0\end{pmatrix}, \quad \hhat{\bw}\,\mathbf{a} = \bw \times \mathbf{a}
+\end{equation}
+
+指数映射（Rodrigues 公式）：
+\begin{equation}
+  \Exp(\boldsymbol{\theta}) = I + \frac{\sin\norm{\boldsymbol{\theta}}}{\norm{\boldsymbol{\theta}}}\,\hhat{\boldsymbol{\theta}} + \frac{1-\cos\norm{\boldsymbol{\theta}}}{\norm{\boldsymbol{\theta}}^2}\,\hhat{\boldsymbol{\theta}}^2
+\end{equation}
+
+对数映射：
+\begin{equation}
+  \Log(R) = \frac{\phi}{2\sin\phi}\begin{pmatrix}R_{32}-R_{23}\\R_{13}-R_{31}\\R_{21}-R_{12}\end{pmatrix}, \quad \phi = \arccos\!\left(\frac{\mathrm{tr}(R)-1}{2}\right)
+\end{equation}
+
+%% ============================================================
+\section{飞行器动力学模型}
+%% ============================================================
+
+\subsection{连续时间动力学}
+
+多旋翼飞行器在ENU坐标系中的刚体动力学（忽略陀螺效应）为：
+\begin{align}
+  \dot{\bp} &= \bv \label{eq:dyn_p}\\
+  \dot{\bv} &= -g\,\mathbf{e}_3 + a_T\,R\,\mathbf{e}_3 \label{eq:dyn_v}\\
+  \dot{R}   &= R\,\hhat{\bw} \label{eq:dyn_R}
+\end{align}
+
+其中 $a_T\,R\,\mathbf{e}_3$ 为机体推力方向在惯性系下的加速度分量，$g\,\mathbf{e}_3$ 为重力加速度。
+
+\subsection{一阶欧拉离散化（ZOH）}
+
+给定时间步长 $\Delta t$，系统离散化为：
+\begin{align}
+  \bp_{k+1} &= \bp_k + \Delta t\,\bv_k \\
+  \bv_{k+1} &= \bv_k + \Delta t\!\left(-g\,\mathbf{e}_3 + a_{T,k}\,R_k\,\mathbf{e}_3\right) \\
+  R_{k+1}   &= R_k\,\Exp\!\left(\Delta t\,\bw_k\right)
+\end{align}
+
+\subsection{气动阻力修正}
+
+实机参数中包含线性气动阻力项（\texttt{aero} 参数组），在速度环中加入机体系阻力补偿：
+\begin{equation}
+  \mathbf{f}_{\text{drag}} = -\diag(k_{dx},\,k_{dy},\,k_{dz})\,\bv_B, \quad \bv_B = R^T\bv
+\end{equation}
+其中 $k_{dx}=0.26$，$k_{dy}=0.28$，$k_{dz}=0.42$（单位 kg/s）。
+
+%% ============================================================
+\section{微分平坦性}
+%% ============================================================
+
+多旋翼系统对输出 $(\bp,\psi)$（位置+偏航角）具有微分平坦性，即任意光滑轨迹 $\bp(t)$ 均可唯一确定全状态和控制输入。
+
+\subsection{推力方向重构}
+
+由期望加速度 $\mathbf{a}_d = \ddot{\bp}_d + g\,\mathbf{e}_3$ 得到机体 $z$ 轴方向：
+\begin{equation}
+  \mathbf{b}_3 = \frac{\mathbf{a}_d}{\norm{\mathbf{a}_d}}, \qquad a_T = \norm{\mathbf{a}_d}
+\end{equation}
+
+\subsection{完整姿态重构}
+
+给定偏航参考 $\psi_d$，定义水平参考向量 $\mathbf{b}_{1c} = (\cos\psi_d,\sin\psi_d,0)^T$，则：
+\begin{equation}
+  \mathbf{b}_2 = \frac{\mathbf{b}_3 \times \mathbf{b}_{1c}}{\norm{\mathbf{b}_3 \times \mathbf{b}_{1c}}}, \qquad
+  \mathbf{b}_1 = \mathbf{b}_2 \times \mathbf{b}_3, \qquad
+  R_d = \begin{bmatrix}\mathbf{b}_1 & \mathbf{b}_2 & \mathbf{b}_3\end{bmatrix}
+\end{equation}
+
+\subsection{角速度前馈}
+
+对姿态矩阵关于时间求导 $\dot{R}_d = R_d\,\hhat{\bw_d}$，因此：
+\begin{equation}
+  \hhat{\bw_d} = R_d^T\,\dot{R}_d \implies \bw_d = \mathrm{vex}\!\left(R_d^T\,\dot{R}_d\right)
+\end{equation}
+桶滚轨迹 (\texttt{barrel\_roll\_trajectory.cpp}) 即通过对 $R(t)$ 解析求导获取精确角速度前馈，避免有限差分误差。
+
+%% ============================================================
+\section{飞行状态机 (FSM)}
+%% ============================================================
+
+\subsection{状态集合与转移条件}
+
+状态机定义于 \texttt{px4ctrlfsm.h/cpp}，共 6 个状态：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+状态 & 触发条件 & 行为 \\
+\midrule
+\texttt{manual\_on} & 初始状态，数据就绪前 & 等待 \\
+\texttt{manual}     & aux1 拨 UP，切入 Offboard 成功 & 直通 RC 指令 \\
+\texttt{auto\_hover}& aux2 拨 MID，位置有效 & 悬停于当前位置 \\
+\texttt{cmd}        & aux2 拨 UP & 执行预装轨迹 \\
+\texttt{safe}       & RC 超时 1.5\,s 或 kill 开关 UP & 匀速下降 0.3\,m/s \\
+\texttt{err}        & 传感器失效 & 紧急处理 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{无遥控自动时序（\texttt{USE\_WITHOUT\_RC}）}
+
+编译宏 \texttt{USE\_WITHOUT\_RC} 开启时，系统按固定时间轴自动推进状态：
+\begin{align*}
+  t \geq 0.1\,\text{s} &\implies \text{切入 auto\_hover}\\
+  t \geq 2.1\,\text{s} &\implies \text{切入 cmd（执行轨迹）}
+\end{align*}
+调参模式下 hover 延迟延长至 3.0\,s。
+
+\subsection{8 字参考轨迹（\texttt{set\_2D8\_ref}）}
+
+FSM 内置参数化 8 字水平轨迹，提供解析的 $\bp/\bv/\mathbf{a}/\text{jerk}/\text{snap}$，以 Logistic 包络从 0 加速至 2.5\,m/s，可作为 MPC 的多步预瞄参考。
+
+%% ============================================================
+\section{串级 PID 控制器（QuadControl）}
+%% ============================================================
+
+源码：\texttt{controller.h / controller.cpp}，后端编号 0。
+
+\subsection{控制链路}
+
+\[
+  \bp_d \xrightarrow{\text{位置 P}} \bv_d \xrightarrow{\text{速度 PID}} \mathbf{F}_d \xrightarrow{\text{微分平坦}} R_d,\,a_T \xrightarrow{\text{姿态 P}} \bw_d
+\]
+
+\subsection{位置环（P 控制）}
+
+\begin{equation}
+  \bv_d = \bv_{\text{ff}} + K_p^{\text{pos}}\!\left(\bp_d - \bp\right)
+\end{equation}
+$K_p^{\text{pos}} = \diag(2.5,\;1.5,\;1.5)$，$\bv_{\text{ff}}$ 为轨迹前馈速度。
+
+\subsection{速度环（PID 控制）}
+
+\begin{equation}
+  \mathbf{a}_d = K_p^{vel}e_v + K_i^{vel}\!\int e_v\,dt + K_d^{vel}\dot{e}_v + \mathbf{a}_{\text{ff}}
+\end{equation}
+$K_p^{vel}=\diag(4.0,3.0,2.5)$，$K_i^{vel}=\diag(0.8,0.8,0.5)$，$K_d^{vel}=\diag(0.2,0.2,0.0)$。
+
+加入重力补偿与气动阻力前馈：
+\begin{equation}
+  \mathbf{a}_T^{\text{vec}} = \mathbf{a}_d + g\,\mathbf{e}_3 - R\,\diag(k_{dx},k_{dy},k_{dz})\,R^T\bv
+\end{equation}
+
+\subsection{微分平坦姿态生成}
+
+由 $\mathbf{a}_T^{\text{vec}}$ 按第 5 节公式重构期望姿态 $R_d$ 与推力加速度 $a_T = \norm{\mathbf{a}_T^{\text{vec}}}$。总推力：
+\begin{equation}
+  F_T = m\,a_T
+\end{equation}
+
+\subsection{姿态环（四元数 P 控制）}
+
+将当前姿态 $\bq$ 与期望姿态 $\bq_d$ 的误差用四元数表示：
+\begin{equation}
+  \bq_e = \bq^{-1}\otimes\bq_d, \qquad \text{若 } q_{e,w}<0 \text{ 则 } \bq_e \leftarrow -\bq_e
+\end{equation}
+（后一步消除双重覆盖歧义，保证走最短路径。）期望角速度：
+\begin{equation}
+  \bw_d = 2\,K_q\,\mathrm{sign}(q_{e,w})\,\bq_{e,\text{vec}} + \bw_{\text{ff}}
+\end{equation}
+其中姿态增益 $K_q = \diag(12,\;13,\;2)$，$\bw_{\text{ff}}$ 为轨迹角速度前馈。
+
+\subsection{手动模式直通}
+
+在 \texttt{manual} 状态下（\texttt{fsm\_state==1}），控制器绕过位置/速度环，直接由 RC 摇杆生成指令：
+\begin{align}
+  \bq_e &= \bq^{-1}\otimes\bq_{\text{rc}}, \quad (\text{若 } q_{e,w}<0 \text{ 取反})\\
+  \bw_d &= 8\,\bq_{e,\text{vec}} + (0,0,\psi_{\text{rate}})^T\\
+  F_T &= 4\left(u_{\min} + \text{throttle}\cdot(u_{\max}-u_{\min})\right)
+\end{align}
+此逻辑在 QuadControl、GptMpcControl、SolverNmpc 三者中一致实现，保证后端切换时手动行为不变。
+
+%% ============================================================
+\section{SO(3) 流形线性时变 MPC（LTV-MPC / GptMpcControl）}
+%% ============================================================
+
+源码：\texttt{gptmpc.h / gptmpc.cpp}，后端编号 1，求解器为 OSQP。
+
+\subsection{系统状态与误差坐标}
+
+状态定义为 $\bx = (\bp,\,\bv,\,R) \in \R^3\times\R^3\times\SO$，控制输入为 $\bu = (a_T,\,\bw)\in\R\times\R^3$。
+
+为在欧式空间中处理 $\SO$ 元素，在参考轨迹 $(\bp^d,\,\bv^d,\,R^d,\,a_T^d,\,\bw^d)$ 处定义 9 维局部误差坐标：
+\begin{equation}
+  \mathbf{e} = \begin{pmatrix}\delta\bp\\\delta\bv\\\boldsymbol{\phi}\end{pmatrix} \in \R^9, \quad
+  \delta\bp = \bp-\bp^d,\quad \delta\bv = \bv-\bv^d,\quad \boldsymbol{\phi} = \Log\!\left((R^d)^T R\right)
+\end{equation}
+其中 $\boldsymbol{\phi}\in\R^3$ 为从 $R^d$ 到 $R$ 的旋转向量（李代数元素）。
+
+\subsection{误差动力学线性化}
+
+在参考点 $(\bx^d_k, \bu^d_k)$ 处对连续动力学 \eqref{eq:dyn_p}--\eqref{eq:dyn_R} 进行一阶线性化并离散，得：
+\begin{equation}
+  \mathbf{e}_{k+1} = A_k\,\mathbf{e}_k + B_k\,\delta\bu_k + \mathbf{c}_k
+  \tag{M4}
+\end{equation}
+其中 $\delta\bu_k = \bu_k - \bu^d_k$，仿射项 $\mathbf{c}_k$ 由参考轨迹的离散误差（defect）产生。矩阵 $A_k\in\R^{9\times9}$，$B_k\in\R^{9\times4}$ 均通过解析推导获得。
+
+\subsection{预测模型凝聚（批量展开）}
+
+将 $N$（默认 8）步误差沿时间轴递推并堆叠为全局向量：
+\begin{align}
+  \mathbf{E} &= S_x\,\mathbf{e}_0 + S_u\,\Delta\mathbf{U} + \mathbf{s}_{\text{aff}}
+  \tag{M5}
+\end{align}
+其中
+\[
+  \mathbf{E} = \begin{pmatrix}\mathbf{e}_1\\\vdots\\\mathbf{e}_N\end{pmatrix} \in \R^{9N},\quad
+  \Delta\mathbf{U} = \begin{pmatrix}\delta\bu_0\\\vdots\\\delta\bu_{N-1}\end{pmatrix} \in \R^{4N}
+\]
+矩阵 $S_x\in\R^{9N\times9}$，$S_u\in\R^{9N\times4N}$ 由 $A_k, B_k$ 递推构成下三角结构，$\mathbf{s}_{\text{aff}}$ 含各步仿射项的累积。
+
+凝聚策略将决策变量规模由 $13N$（状态+控制分离法）压缩为 $4N$（$N=8$ 时仅 32 维 QP）。
+
+\subsection{二次规划目标函数}
+
+定义加权预测误差代价与控制增量代价：
+\begin{equation}
+  J = \mathbf{E}^T\bar{Q}\,\mathbf{E} + \Delta\mathbf{U}^T\bar{R}\,\Delta\mathbf{U}
+  \tag{M6}
+\end{equation}
+代入 (M5) 展开，得到标准 QP 形式：
+\begin{equation}
+  \min_{\Delta\mathbf{U}}\;\frac{1}{2}\Delta\mathbf{U}^T H\,\Delta\mathbf{U} + \mathbf{q}^T\Delta\mathbf{U}
+  \tag{M8}
+\end{equation}
+\[
+  H = 2\!\left(S_u^T\bar{Q}\,S_u + \bar{R}\right), \quad \mathbf{q} = 2\,S_u^T\bar{Q}\!\left(S_x\,\mathbf{e}_0 + \mathbf{s}_{\text{aff}}\right)
+\]
+
+加权矩阵（每步相同）：
+\begin{align*}
+  Q &= \diag(15000,15000,15000,\;40,40,40,\;80,80,80) \quad (\text{位置/速度/姿态})\\
+  R &= \diag(0.5,\;0.6,0.6,0.6) \quad (\text{推力加速度/三轴角速度})
+\end{align*}
+
+\subsection{输入盒约束}
+
+\begin{equation}
+  \bu_{\min} - \bu^d \;\leq\; \delta\bu \;\leq\; \bu_{\max} - \bu^d
+  \tag{M7}
+\end{equation}
+控制上下界来自 \texttt{motor} 参数组，$u_{\min}$/$u_{\max}$ 为单电机推力边界的归一化值。
+
+\subsection{滚动时域执行}
+
+OSQP 求得最优增量序列 $\Delta\mathbf{U}^*$ 后，只取第一步：
+\begin{equation}
+  \bu_{\text{cmd}} = \bu^d_0 + \delta\bu^*_0
+  \tag{M9}
+\end{equation}
+下一控制周期平移参考轨迹，重新线性化并求解新 QP。
+
+\subsection{参考来源优先级}
+
+\texttt{calculateControl()} 内部按以下优先级选取预瞄参考：
+\begin{enumerate}
+  \item 离线 \texttt{GptTrajectoryResult} 轨迹（\texttt{setTrajectory()} 装载后），提供完整的 $p/v/R/a_T/\omega$ 序列；
+  \item 外部多点预瞄 \texttt{preview\_}（\texttt{setReferencePreview()} 设置后）；
+  \item 单个 \texttt{Ref\_State\_t} 的 Taylor 短时外推（最低精度，仅用于悬停）。
+\end{enumerate}
+
+\subsection{推力单位换算}
+
+MPC 输出质量归一化推力加速度 $a_T$，最终乘以质量换算为牛顿制合力：
+\begin{equation}
+  F_T = m\,a_T \tag{M10}
+\end{equation}
+
+%% ============================================================
+\section{非线性 MPC（SolverNmpc）——四后端统一框架}
+%% ============================================================
+
+源码：\texttt{solver\_nmpc.h}、\texttt{solver\_nmpc\_common.cpp}、\texttt{solver\_nmpc\_backend.h}，以及四个后端实现文件。后端编号 2/3/4/5。
+
+\subsection{统一外壳（pimpl 模式）}
+
+\texttt{SolverNmpcControl} 通过 pimpl 隐藏后端实现，内部 \texttt{Impl} 负责与后端无关的公共逻辑：
+\begin{itemize}
+  \item 构造参考向量序列（与 GptMpcControl 相同的三级优先策略）；
+  \item 四元数符号对齐，消除 $\bq/-\bq$ 双重覆盖歧义；
+  \item 求解失败时保持上一条有效命令（安全回退）；
+  \item 将 $a_T$ 换算为 $F_T = m\,a_T$。
+\end{itemize}
+四个后端（acados / Ipopt+Eigen / NLopt+Eigen / Ipopt+CasADi）均继承 \texttt{SolverNmpcBackendBase} 抽象基类，实现统一的 \texttt{solve()} 接口。
+
+\subsection{NLP 问题形式}
+
+状态向量采用四元数表示（10 维），控制 4 维：
+\begin{equation}
+  \bx = (\bp,\,\bv,\,\bq) \in \R^{10}, \qquad \bu = (a_T,\,\omega_x,\,\omega_y,\,\omega_z) \in \R^4
+\end{equation}
+优化问题为标准多重打靶 OCP：
+\begin{align}
+  \min_{\bx_{0:N},\,\bu_{0:N-1}}\quad & \sum_{k=0}^{N-1}\ell(\bx_k,\bu_k,\bx_k^{\text{ref}}) + \ell_N(\bx_N,\bx_N^{\text{ref}})\\
+  \text{s.t.}\quad & \bx_0 = \bx_{\text{curr}}\\
+  & \bx_{k+1} = f_d(\bx_k,\bu_k),\quad k=0,\dots,N-1\\
+  & \bu_{\min}\leq\bu_k\leq\bu_{\max}
+\end{align}
+其中四元数动力学离散采用 $\bq_{k+1} = \bq_k \otimes \exp\!\left(\tfrac{1}{2}\Delta t\,\bw_k\right)$，随后归一化。
+
+\subsection{通用代价函数}
+
+\texttt{solver\_nmpc\_common.cpp} 中 \texttt{solverNmpcObjective()} 定义的分阶段代价（Eigen 后端使用；acados 通过生成代码内联同权重）：
+\begin{align}
+  \ell &= 18\norm{\delta\bp}^2 + 3\norm{\delta\bv}^2 + 5\left(1-(\bq\!\cdot\!\bq^{\text{ref}})^2\right)\notag\\
+       &\quad + 0.10\,(a_T-a_T^{\text{ref}})^2 + 0.12\norm{\bw-\bw^{\text{ref}}}^2\notag\\
+       &\quad + 0.02\,(\Delta a_T)^2 + 0.12\norm{\Delta\bw}^2\\
+  \ell_N &= 35\norm{\delta\bp}^2 + 6\norm{\delta\bv}^2 + 10\left(1-(\bq\!\cdot\!\bq^{\text{ref}})^2\right)
+\end{align}
+姿态误差项 $1-(\bq\cdot\bq^{\text{ref}})^2$ 是四元数点积的自然测度，对 $\pm\bq$ 对称，天然处理双重覆盖问题；$\Delta a_T, \Delta\bw$ 为相邻控制增量的平滑正则。
+
+\subsection{后端 3：acados（当前默认）}
+
+源码：\texttt{solver\_nmpc\_acados.cpp}，配合 \texttt{3rdpart/acados/generated/px4ctrl\_nmpc/} 中脚本 \texttt{generate\_px4ctrl\_acados\_nmpc.py} 自动生成的 C 代码。
+
+\begin{itemize}
+  \item 求解算法：实时迭代 SQP（RTI），QP 子问题用 HPIPM（内点法）+ BLASFEO 高性能线性代数；
+  \item 预测窗：$N=12$ 步，$\Delta t = 0.04$\,s，即 $0.48$\,s 前视窗；
+  \item 热启动：将上一解按时间平移作为初值（\texttt{shift}），否则冷启动；
+  \item 每周期设置初始状态约束 $\bx_0$、各阶段输入约束和代价参考，调用 \texttt{acados\_solve()}。
+\end{itemize}
+acados 是四后端中实时性能最好的，适合嵌入式实机运行。
+
+\subsection{后端 2/5：Ipopt}
+
+\begin{itemize}
+  \item \textbf{Ipopt + Eigen}（编号 2，\texttt{solver\_nmpc\_ipopt\_eigen.cpp}）：手写 Eigen 雅可比/梯度，接入 COIN-OR Ipopt（内点法），MUMPS 稀疏线性求解器；
+  \item \textbf{Ipopt + CasADi}（编号 5，\texttt{solver\_nmpc\_casadi.cpp}）：用 CasADi 符号自动微分生成精确梯度/Hessian，再交 Ipopt 求解。通过 \texttt{solver\_nmpc\_casadi\_bridge}（纯 C 桥接）隔离 CasADi 的 C++ 类型，避免与主工程 ABI 冲突。
+\end{itemize}
+Ipopt 后端精度高、收敛稳健，但单次求解耗时较长，主要用于离线对比与验证。
+
+\subsection{后端 4：NLopt}
+
+源码：\texttt{solver\_nmpc\_nlopt\_eigen.cpp}。使用 NLopt 的 SLSQP/增广拉格朗日等梯度算法，Eigen 提供目标与约束的解析梯度。作为无需外部大型依赖的轻量非线性求解备选。
+
+\subsection{四后端对比}
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+编号 & 后端 & 求解算法 & 微分方式 & 定位 \\
+\midrule
+2 & Ipopt+Eigen  & 内点法 & 手写解析 & 高精度基准 \\
+3 & acados       & RTI-SQP+HPIPM & 生成代码 & 实机实时（默认）\\
+4 & NLopt+Eigen  & SLSQP & 手写解析 & 轻量备选 \\
+5 & Ipopt+CasADi & 内点法 & 自动微分 & 验证/对拍 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{桶滚轨迹生成（Barrel Roll Trajectory）}
+%% ============================================================
+
+源码：\texttt{barrel\_roll\_trajectory.h / barrel\_roll\_trajectory.cpp}，编译期宏 \texttt{PX4CTRL\_USE\_BARREL\_ROLL\_CMD\_TRAJECTORY=1} 时生效。
+
+\subsection{五段结构}
+
+\begin{center}
+\begin{tabular}{clll}
+\toprule
+阶段 & 名称 & 时长 & 描述 \\
+\midrule
+1 & 起飞    & 2.5\,s & 竖直上升 1\,m，七次 Hermite 多项式 \\
+2 & 稳定悬停 & 0.5\,s & 原地静止 \\
+3 & 进入段  & 1.5\,s & 从静止加速至轴向速度 \\
+4 & 滚转段  & 3.5\,s & 解析螺旋线，七阶时间律 \\
+5 & 退出段  & 1.5\,s & 从轴向速度减速至静止 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{七次 Hermite 多项式（起飞/进出段）}
+
+设段归一化时间 $s = t/T_{\text{seg}} \in [0,1]$，七阶平滑时间律为：
+\begin{equation}
+  \sigma(s) = 35s^4 - 84s^5 + 70s^6 - 20s^7
+\end{equation}
+满足 $\sigma(0)=0$，$\sigma(1)=1$，且端点处一至三阶导数均为零，保证进/出段的速度、加速度、jerk 连续。
+
+位置插值 $\bp(t) = \bp_{\text{start}} + (\bp_{\text{end}}-\bp_{\text{start}})\,\sigma(s)$，速度/加速度/jerk/snap 均通过对 $\sigma$ 解析求导获得。
+
+\subsection{滚转段解析螺旋线}
+
+设螺旋轴方向为 $\hat{\mathbf{a}}$（通常为前飞方向 $\mathbf{e}_x$），滚转角 $\theta(t) = 2\pi\cdot\sigma(s)$（完整一圈），螺旋半径 $r$，轴向推进速度 $v_{\text{axial}}$：
+\begin{equation}
+  \bp(t) = \bp_{\text{entry}} + v_{\text{axial}}\,t\,\hat{\mathbf{a}} + r\cos\theta(t)\,\hat{\mathbf{n}}_1 + r\sin\theta(t)\,\hat{\mathbf{n}}_2
+\end{equation}
+其中 $\hat{\mathbf{n}}_1, \hat{\mathbf{n}}_2$ 为与 $\hat{\mathbf{a}}$ 正交的基向量。对上式解析求导得到 $\bv, \mathbf{a}, \text{jerk}, \text{snap}$。
+
+\subsection{微分平坦姿态生成}
+
+每个采样点由 $\mathbf{a}+g\mathbf{e}_3$ 计算推力方向 $\mathbf{b}_3$，通过第 5 节公式重构完整姿态矩阵 $R = [\mathbf{b}_1,\mathbf{b}_2,\mathbf{b}_3]$。角速度通过 $\hhat{\bw} = R^T\dot{R}$（解析求导，非差分）精确计算，保证 MPC 参考输入的动力学一致性，避免有限差分误差。
+
+%% ============================================================
+\section{Minimum-Snap 轨迹生成}
+%% ============================================================
+
+源码：\texttt{minimum\_snap\_trajectory.h / minimum\_snap\_trajectory.cpp}，编译期宏 \texttt{PX4CTRL\_USE\_BARREL\_ROLL\_CMD\_TRAJECTORY=0} 时生效。
+
+\subsection{分段多项式表示}
+
+给定 $M$ 个航点，轨迹分为 $M-1$ 段，每段用 $n$ 次（通常 $n=7$）多项式表示：
+\begin{equation}
+  p_j(t) = \sum_{i=0}^{n} c_{j,i}\,\left(\frac{t-t_{j-1}}{T_j}\right)^i, \quad t\in[t_{j-1},\,t_j]
+\end{equation}
+其中 $T_j = t_j - t_{j-1}$ 为第 $j$ 段时长，$c_{j,i}$ 为待求系数。
+
+\subsection{优化问题}
+
+最小化全局 snap（四阶导数）的 $L^2$ 范数：
+\begin{equation}
+  \min_{\{c_{j,i}\}} \sum_{j=1}^{M-1}\int_{t_{j-1}}^{t_j} \left\|\frac{d^4 p_j}{dt^4}\right\|^2 dt
+\end{equation}
+约束条件：航点位置约束 $p_j(t_{j-1})=\bp_{j-1}$、$p_j(t_j)=\bp_j$；内部节点到 3 阶导数连续；端点高阶导数为零。构成带等式约束的 QP，通过 block-diagonal 结构解析求解。
+
+%% ============================================================
+\section{SCP 最短时间轨迹优化（GptTraj）}
+%% ============================================================
+
+源码：\texttt{gpttraj.h / gpttraj.cpp}，求解器为 OSQP。实现序贯凸规划（SCP）+ 二分最短时间搜索 + CSTC 航点进度约束。
+
+\subsection{连续动力学}
+
+状态 $\bx_k=(\bp_k,\bv_k,R_k)$，控制 $\bu_k=(a_{T,k},\bw_k)$，ZOH 离散同第 3 节，时间节点数 $N=60$。
+
+\subsection{QP 决策变量布局}
+
+设航点数 $W$：
+\begin{equation}
+  \mathbf{z} = \bigl[\underbrace{\delta\bx_{0:N}}_{9(N+1)},\;\underbrace{\delta\bu_{0:N-1}}_{4N},\;\underbrace{\boldsymbol{\nu}_{0:N-1}}_{9N},\;\underbrace{\boldsymbol{\lambda}}_{(N+1)W},\;\underbrace{\boldsymbol{\mu}}_{NW},\;\underbrace{\mathbf{s}_{\text{wp}}}_{NW},\;\underbrace{\mathbf{s}_{\text{ord}}}_{N(W-1)}\bigr]
+\end{equation}
+其中 $\boldsymbol{\nu}$ 为动力学虚拟控制量，$\lambda_{k,j}$ 为第 $j$ 个航点在时刻 $k$ 的剩余进度，$\mu_{k,j}$ 为单步进度消耗，$\mathbf{s}$ 为松弛变量。
+
+\subsection{目标函数}
+
+\begin{align}
+  J &= \rho_x \sum_k\norm{\delta\bx_k}^2 + \rho_u \sum_k\norm{\bar{\bu}_k - \bu_{\text{hov}}}^2 + \rho_{\Delta u}\sum_k\norm{\bu_k - \bu_{k-1}}^2\notag\\
+    &\quad + \rho_\nu\sum_k\norm{\boldsymbol{\nu}_k}^2 + \rho_\mu\sum_k\norm{\delta\boldsymbol{\mu}_k}^2 + w_s\sum_{k,j}(s_{\text{wp},k,j}+s_{\text{ord},k,j})
+\end{align}
+参数：$\rho_x=1.0$，$\rho_u=0.05$，$\rho_{\Delta u}=0.2$，$\rho_\nu=10^5$，$\rho_\mu=1.0$，$w_s=2\times10^5$，$\bu_{\text{hov}}=(g,0,0,0)^T$。
+
+\subsection{CSTC 航点进度约束}
+
+CSTC（Continuous Space-Time Constraint）将航点次序与通过时刻统一建模。进度变量满足：
+\begin{align}
+  &\lambda_{k+1,j} - \lambda_{k,j} + \mu_{k,j} = 0 &&\text{（进度动力学）}\tag{F7}\\
+  &\lambda_{0,j} = 1,\quad \lambda_{N,j} = 0 &&\text{（边界）}\\
+  &\lambda_{k,j} \leq \lambda_{k,j+1} &&\text{（弱次序）}\\
+  &\mu_{k,j}\!\left(\norm{\bp_k - \bp_j}^2 - r_j^2\right) \leq \sigma_i + s_{\text{wp}} &&\text{（空间互补）}\tag{F8}\\
+  &\lambda_{k,j}\,\mu_{k,j+1} \leq \sigma_i + s_{\text{ord}} &&\text{（次序互补）}\tag{F9}
+\end{align}
+松弛 $\sigma_i = \sigma_0 \cdot \text{decay}^i$（初值 0.05，衰减 0.5）随 SCP 迭代几何衰减至 0，逐步收紧约束。
+
+\subsection{SCP 迭代流程}
+
+\begin{algorithm}[H]
+\caption{SCP 最短时间轨迹优化}
+\begin{algorithmic}[1]
+\State 初始化时间 $T_0$，用直线插值+速度估计初始化 $\bar{\bx}, \bar{\bu}$
+\For{外层：二分时间搜索（最多 16 次）}
+  \For{内层：SCP 迭代（最多 12 次）}
+    \State 在 $(\bar{\bx}_k, \bar{\bu}_k)$ 处计算线性化 $A_k, B_k$（前向差分 $\epsilon=10^{-6}$）
+    \State 构造并用 OSQP 求解凸 QP（含 CSTC 线性化约束）
+    \State 回溯线搜索（$\alpha\in\{1,1/2,\dots\}$）计算 merit，接受/拒绝步
+    \State 自适应信赖域缩放：接受 $\to$ 扩大，拒绝 $\to$ 缩小
+    \If{动力学残差 $<5\times10^{-2}$ 且 CSTC 残差 $<10^{-4}$}
+      \State \textbf{break}
+    \EndIf
+  \EndFor
+  \State 更新可行/不可行时间界，二分 $T \leftarrow (T_{\text{feas}}+T_{\text{infeas}})/2$
+\EndFor
+\State \Return \texttt{GptTrajectoryResult}（$p/v/R/a_T/\bw$ 序列）
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{航点通过时刻恢复}
+
+由进度变量恢复第 $j$ 个航点的通过时刻：
+\begin{equation}
+  t_j = \frac{T}{N}\sum_{k=0}^{N-1} k\,\mu_{k,j}
+  \tag{F13}
+\end{equation}
+
+\subsection{时间缩放热启动与插值}
+
+新旧时间之间位置路径不变，速度按比例缩放 $\bv^{\text{new}}_k = \frac{T_{\text{old}}}{T_{\text{new}}}\bv^{\text{old}}_k$，CSTC 进度变量直接复制。查询时位置/速度/推力/角速度线性插值，姿态用四元数 SLERP：$\bq(t)=\text{Slerp}(\bq_i,\bq_{i+1},\alpha)$。
+
+%% ============================================================
+\section{内环：角速度控制与电机分配}
+%% ============================================================
+
+源码：\texttt{px4ctrlrate\_node.cpp}，运行频率 400\,Hz。
+
+\subsection{角速度 PID}
+
+内环接收外环输出的 $\bw_d, F_T$，运行角速度 PID：
+\begin{equation}
+  \boldsymbol{\tau} = K_p^{\omega}(\bw_d-\bw) + K_i^{\omega}\!\int(\bw_d-\bw)\,dt + K_d^{\omega}\dot{e}_{\omega}
+\end{equation}
+增益：$K_p^{\omega}=\diag(16,18,4)$，$K_i^{\omega}=\diag(3,3,0.5)$，$K_d^{\omega}=\diag(0.05,0.05,0)$。角速度微分 $\dot{\bw}$ 采用滑动窗口 TVR（SuiteSparse/UMFPACK 稀疏求解）代替简单差分，抑制陀螺噪声。
+
+\subsection{控制分配（逆矩阵法）}
+
+X 型四旋翼，电机安装角 $\beta=50.56°$，臂长 $l=0.1125$\,m。力/力矩到电机推力映射：
+\begin{equation}
+  \begin{pmatrix}F_T\\\tau_x\\\tau_y\\\tau_z\end{pmatrix} = B\begin{pmatrix}f_1\\f_2\\f_3\\f_4\end{pmatrix}
+\end{equation}
+混合矩阵 $B$ 由电机位置、转向和扭矩系数确定，电机推力通过 $B^{-1}$ 逆矩阵直接求解（弃用旧版 OSQP 分配器）。单电机推力经二次多项式反解转速指令。
+
+%% ============================================================
+\section{关键参数汇总}
+%% ============================================================
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+参数 & 值 & 说明 \\
+\midrule
+$m$ & 0.7311\,kg & 质量 \\
+$g$ & 9.805\,m/s² & 重力 \\
+$J_{vx},J_{vy},J_{vz}$ & 2.48/2.67/4.34 $\times10^{-3}$ & 主惯量 kg·m² \\
+$l$ & 0.1125\,m & 臂长 \\
+$\beta$ & 50.56° & 电机安装角 \\
+$r_p$ & 0.06475\,m & 桨半径（5.1寸）\\
+外环频率 & 200\,Hz & \texttt{ctrl\_freq\_max} \\
+内环频率 & 400\,Hz & \texttt{ratectrl\_freq\_max} \\
+低通截止 & 10\,Hz & acc/gyro LPF \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{总结：控制链路数据流}
+%% ============================================================
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+环节 & 数据流 \\
+\midrule
+离线轨迹优化 & \texttt{gpttraj}: SCP+OSQP $\to$ $p/v/R/a_T/\bw$ 序列 \\
+轨迹装载 & \texttt{setTrajectory()} \\
+外环控制（200\,Hz） & LTV-MPC 或 NMPC $\to$ $(a_T, \bw_d)$ \\
+单位换算 & $F_T = m\,a_T$ \\
+话题传递 & \texttt{/rates\_thrust\_setpoint} \\
+内环控制（400\,Hz） & 角速度 PID $\to$ $\boldsymbol{\tau}$ \\
+控制分配 & $B^{-1}(F_T,\boldsymbol{\tau}) \to f_{1:4}$ \\
+PX4 底层 & \texttt{/fmu/in/actuator\_motors} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection*{编译期控制器/轨迹选择速查}
+
+\begin{lstlisting}
+// px4ctrlfsm.h
+#define PX4CTRL_PRIMARY_CONTROLLER             3  // 0~5
+#define PX4CTRL_USE_BARREL_ROLL_CMD_TRAJECTORY 1  // 1=桶滚, 0=min-snap
+
+// input.h
+#define SIMULATION       // 仿真: 使用 joy_msgs
+#define USE_WITHOUT_RC   // 无遥控自动时序
+\end{lstlisting}
+
+\end{document}

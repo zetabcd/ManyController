@@ -1,0 +1,22 @@
+coinor-ipopt for Debian
+-----------------------
+
+As noted in the description, this package is built against the MUMPS
+library and, by extension, its dependencies (BLAS and LAPACK).  The
+reason for this is that of all the solver options, the MUMPS library
+is the only one that is Free Software and included in Debian.  If you
+choose, you can rebuild this package against one of the other solver
+libraries, but the resulting package is almost certainly not
+distributable.
+
+Building against coinor-ipopt
+-----------------------------
+
+When building against coinor-ipopt, use pkg-config for compiler and
+linker flags, e.g.:
+
+$ pkg-config --cflags ipopt
+$ pkg-config --libs ipopt
+$ g++ `pkg-config --cflags --libs ipopt` <file_name> -o <file_name.out>
+
+ -- Greg Horn <gregmainland@gmail.com>  Thu, 28 Aug 2014 10:41:20 +0200

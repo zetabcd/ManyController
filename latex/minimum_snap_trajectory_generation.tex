@@ -1,0 +1,374 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage{booktabs,tabularx,array}
+\usepackage{enumitem,geometry,xcolor,hyperref}
+
+\geometry{left=22mm,right=22mm,top=23mm,bottom=24mm}
+\hypersetup{colorlinks=true,linkcolor=blue!55!black,urlcolor=blue!55!black}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.25em}
+\renewcommand{\arraystretch}{1.25}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\SO}{\mathrm{SO}(3)}
+\newcommand{\trans}{^{\mathsf T}}
+\newcommand{\ee}{\bm e_3}
+\newcommand{\normtwo}[1]{\left\lVert #1\right\rVert_2}
+\newcommand{\Log}{\operatorname{Log}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+\title{当前工程 Minimum-Snap 多项式轨迹的生成方法}
+\author{对应 \code{minimum_snap_trajectory.h/.cpp} 与 \code{px4ctrlfsm.cpp}}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{问题定义}
+
+给定按通过顺序排列的 $M$ 个三维航点
+\begin{equation}
+  \bm w_0,\bm w_1,\ldots,\bm w_{M-1}\in\R^3,
+\end{equation}
+构造 $S=M-1$ 段分段多项式轨迹。当前 CMD 配置使用进入 CMD 时的位置
+$\bm p_{\mathrm{entry}}$ 加十个相对偏移：
+\begin{equation}
+\begin{aligned}
+\Delta\bm w_0&=(0,0,0)\trans,&
+\Delta\bm w_1&=(0.4,0.2,0.1)\trans,\\
+\Delta\bm w_2&=(0.9,0.6,0.2)\trans,&
+\Delta\bm w_3&=(1.4,1.1,0.3)\trans,\\
+\Delta\bm w_4&=(1.15,1.5,0.4)\trans,&
+\Delta\bm w_5&=(0.4,1.3,0.5)\trans,\\
+\Delta\bm w_6&=(-0.4,0.9,0.6)\trans,&
+\Delta\bm w_7&=(-1.1,0.4,0.675)\trans,\\
+\Delta\bm w_8&=(-1.5,-0.3,0.75)\trans,&
+\Delta\bm w_9&=(-1.1,-1.2,0.8)\trans,
+\end{aligned}
+\end{equation}
+其中 $\bm w_i=\bm p_{\mathrm{entry}}+\Delta\bm w_i$。
+这样轨迹起点与进入 CMD 时的实机位置一致，不会跳到固定地图坐标。
+
+优化目标是最小化位置四阶导数（snap）的平方积分：
+\begin{equation}
+  \boxed{
+  J=\sum_{i=0}^{S-1}\int_0^{T_i}
+  \normtwo{\frac{\mathrm d^4\bm p_i(t)}{\mathrm dt^4}}^2\,\mathrm dt
+  }
+  \label{eq:snap-objective}
+\end{equation}
+并满足航点插值、段间速度/加速度/jerk 连续及首末端静止条件。
+
+\section{航段时间分配}
+
+当前实现不把段时长作为优化变量，而是先按航点距离和名义速度分配：
+\begin{equation}
+  T_i=\max\left(
+  T_{\min},
+  \frac{\normtwo{\bm w_{i+1}-\bm w_i}}{v_{\mathrm{nom}}}
+  \right).
+  \label{eq:time-allocation}
+\end{equation}
+当前参数为
+\begin{equation}
+  v_{\mathrm{nom}}=0.65\ \mathrm{m/s},\qquad
+  T_{\min}=0.2\ \mathrm{s}.
+\end{equation}
+累计节点时刻为
+\begin{equation}
+  t_0=0,\qquad t_{i+1}=t_i+T_i,
+  \qquad T_{\mathrm{total}}=t_S.
+\end{equation}
+
+\section{归一化时间上的七次多项式}
+
+对第 $i$ 段定义局部归一化时间
+\begin{equation}
+  \tau=\frac{t-t_i}{T_i}\in[0,1].
+\end{equation}
+位置使用七次多项式：
+\begin{equation}
+  \bm p_i(\tau)=\sum_{n=0}^{7}\bm c_{i,n}\tau^n,
+  \qquad \bm c_{i,n}\in\R^3.
+  \label{eq:polynomial}
+\end{equation}
+每段有 $8$ 个三维系数。使用 $\tau$ 而不是直接使用绝对时间，可减少长短航段
+混合时的矩阵条件数。
+
+对物理时间求 $r$ 阶导数得到
+\begin{equation}
+  \frac{\mathrm d^r\bm p_i}{\mathrm dt^r}
+  =\sum_{n=r}^{7}
+  \frac{n!}{(n-r)!}\frac{\tau^{n-r}}{T_i^r}\bm c_{i,n}.
+  \label{eq:physical-derivative}
+\end{equation}
+代码中的 \code{basisDerivative()} 正是式~\eqref{eq:physical-derivative} 的标量基函数。
+
+\section{Snap 代价的二次型}
+
+将 $r=4$ 代入式~\eqref{eq:physical-derivative}，并使用
+$\mathrm dt=T_i\,\mathrm d\tau$，第 $i$ 段的代价写为
+\begin{equation}
+  J_i=\bm c_i\trans\bm Q_i\bm c_i,
+\end{equation}
+其中对幂次 $m,n\geq4$，矩阵元素为
+\begin{equation}
+  {\left(\bm Q_i\right)}_{mn}
+  =\frac{m!}{(m-4)!}\frac{n!}{(n-4)!}
+  \frac{1}{m+n-7}\frac{1}{T_i^7},
+  \label{eq:snap-hessian}
+\end{equation}
+而 $m<4$ 或 $n<4$ 时对应元素为零。三个空间轴共用同一个
+$\bm Q=\operatorname{blkdiag}(\bm Q_0,\ldots,\bm Q_{S-1})$，但右端航点坐标不同，
+因此可以一次求解三个右端列。
+
+实现中给 Hessian 对角线增加 $10^{-12}$。这不改变有意义精度下的轨迹，仅用于改善
+snap 代价固有多项式零空间的数值秩判定。
+
+\section{等式约束}
+
+\subsection{每段严格连接相邻航点}
+
+对所有 $i=0,\ldots,S-1$：
+\begin{equation}
+  \bm p_i(0)=\bm w_i,\qquad
+  \bm p_i(1)=\bm w_{i+1}.
+  \label{eq:waypoint-constraints}
+\end{equation}
+
+\subsection{内部节点连续性}
+
+对相邻段 $i$ 与 $i+1$，在内部航点处要求物理时间导数连续：
+\begin{equation}
+  \bm p_i^{(r)}(1)=\bm p_{i+1}^{(r)}(0),
+  \qquad r=1,2,3.
+  \label{eq:continuity}
+\end{equation}
+这分别对应速度、加速度和 jerk 连续。由于优化目标是 snap 平方积分，七次多项式
+配合到三阶的显式连续约束构成当前实现的 minimum-snap 轨迹。
+
+\subsection{首末端静止条件}
+
+当前生成器采用 rest-to-rest 边界：
+\begin{equation}
+\begin{aligned}
+  \bm p_0^{(r)}(0)&=\bm0,\\
+  \bm p_{S-1}^{(r)}(1)&=\bm0,
+  \qquad r=1,2,3.
+\end{aligned}
+\label{eq:boundary-derivatives}
+\end{equation}
+因此起点和终点的速度、加速度、jerk 都为零。
+
+将单轴系数堆叠成 $\bm c\in\R^{8S}$，全部约束可以写为
+\begin{equation}
+  \bm A\bm c=\bm b.
+  \label{eq:equality-system}
+\end{equation}
+约束行数为
+\begin{equation}
+  2S+3(S-1)+6=5S+3.
+\end{equation}
+
+\section{KKT 线性系统求解}
+
+固定段时长后，问题是只有等式约束的凸二次规划：
+\begin{equation}
+\begin{aligned}
+  \min_{\bm c}\quad &\frac12\bm c\trans\bm Q\bm c,\\
+  \mathrm{s.t.}\quad &\bm A\bm c=\bm b.
+\end{aligned}
+\label{eq:qp}
+\end{equation}
+其一阶最优性条件为 KKT 系统
+\begin{equation}
+  \boxed{
+  \begin{bmatrix}
+    \bm Q & \bm A\trans\\
+    \bm A & \bm0
+  \end{bmatrix}
+  \begin{bmatrix}
+    \bm c\\\bm\lambda
+  \end{bmatrix}
+  =
+  \begin{bmatrix}
+    \bm0\\\bm b
+  \end{bmatrix}}
+  \label{eq:kkt}
+\end{equation}
+当前 C++ 实现使用 Eigen 的完全正交分解求式~\eqref{eq:kkt}，并将 $x,y,z$ 三轴
+的 $\bm b$ 组成三列同时求解。求解后还检查
+\begin{equation}
+  \left\lVert\bm A\bm C-\bm B\right\rVert_{\infty}\leq10^{-6},
+\end{equation}
+否则返回失败的 \code{GptTrajectoryResult}。
+
+\section{连续多项式离散为 MPC 轨迹}
+
+设用户配置采样周期为 $\Delta t_{\mathrm{cfg}}$。实现取
+\begin{equation}
+  N=\left\lceil\frac{T_{\mathrm{total}}}{\Delta t_{\mathrm{cfg}}}\right\rceil,
+  \qquad
+  \Delta t=\frac{T_{\mathrm{total}}}{N},
+\end{equation}
+从而最终点严格位于 $T_{\mathrm{total}}$。每个离散节点先由多项式计算
+\begin{equation}
+  \bm p_k=\bm p(t_k),\qquad
+  \bm v_k=\dot{\bm p}(t_k),\qquad
+  \bm a_k=\ddot{\bm p}(t_k).
+\end{equation}
+
+\subsection{由平动轨迹恢复推力和姿态}
+
+工程使用 ENU 坐标，四旋翼平动模型为
+\begin{equation}
+  \dot{\bm v}=-g\ee+a_T\bm R\ee.
+\end{equation}
+因此满足期望加速度所需的质量归一化合力为
+\begin{equation}
+  \bm f_k=\bm a_k+g\ee,
+\end{equation}
+推力加速度及期望机体 $z$ 轴为
+\begin{equation}
+  a_{T,k}=\normtwo{\bm f_k},\qquad
+  \bm z_{B,k}=\frac{\bm f_k}{\normtwo{\bm f_k}}.
+  \label{eq:thrust-attitude}
+\end{equation}
+设进入 CMD 时固定偏航为 $\psi$，定义航向辅助向量
+\begin{equation}
+  \bm y_C=(-\sin\psi,\cos\psi,0)\trans.
+\end{equation}
+随后构造
+\begin{equation}
+\begin{aligned}
+  \bm x_{B,k}&=\frac{\bm y_C\times\bm z_{B,k}}
+  {\normtwo{\bm y_C\times\bm z_{B,k}}},\\
+  \bm y_{B,k}&=\bm z_{B,k}\times\bm x_{B,k},\\
+  \bm R_k&=[\bm x_{B,k}\ \bm y_{B,k}\ \bm z_{B,k}].
+\end{aligned}
+\label{eq:rotation-construction}
+\end{equation}
+代码对合力接近零或叉积退化的情况设置单位轴回退。
+
+\subsection{由相邻姿态得到机体角速度}
+
+为了与 MPC 的离散姿态模型
+\begin{equation}
+  \bm R_{k+1}=\bm R_k\operatorname{Exp}(\Delta t\,\bm\omega_k^\wedge)
+\end{equation}
+一致，离散角速度定义为
+\begin{equation}
+  \boxed{
+  \bm\omega_k=rac{1}{\Delta t}
+  \Log(\bm R_k\trans\bm R_{k+1})}
+  \label{eq:body-rate}
+\end{equation}
+最后一个状态没有后继节点，因此复用倒数第二个节点的角速度。
+
+\section{写入 \code{GptTrajectoryResult} 并由 MPC 使用}
+
+每个离散节点写入
+\begin{equation}
+  \code{GptTrajectoryState}_k=
+  (t_k,\bm p_k,\bm v_k,\bm q_k,a_{T,k},\bm\omega_k),
+\end{equation}
+并依次存入 \code{GptTrajectoryResult::states}。此外还写入总时长和航点时刻：
+\begin{equation}
+  \code{total_time}=T_{\mathrm{total}},\qquad
+  \code{waypoint_times}=[t_0,\ldots,t_S].
+\end{equation}
+
+进入 CMD 的首周期只调用一次
+\begin{equation}
+  \code{controller.setTrajectory(trajectory,start_time)}.
+\end{equation}
+之后第 $j$ 个控制周期根据
+\begin{equation}
+  t_{\mathrm{now}}=t_{\mathrm{ROS}}-t_{\mathrm{start}}
+\end{equation}
+从缓存轨迹中采样
+\begin{equation}
+  t_{\mathrm{now}},\quad
+  t_{\mathrm{now}}+\Delta t_{\mathrm{MPC}},\quad\ldots,\quad
+  t_{\mathrm{now}}+H\Delta t_{\mathrm{MPC}}
+\end{equation}
+共 $H+1$ 个参考节点。缓存采样周期与 MPC 实际周期不完全相同时，位置、速度、推力
+和角速度使用线性插值，姿态使用球面线性插值。MPC 每周期只读取当前窗口，并不重新
+生成整条多项式轨迹。
+
+当前十个航点只是主动选在较小空间内，以形成一条适合控制器验证的弯绕路线；生成器
+没有加入额外空间盒约束或越界拒绝逻辑。表中的实际位置范围是对本次生成结果的离线
+测量，不是优化问题的硬约束。
+
+\section{当前十点轨迹的数值结果}
+
+在 $v_{\mathrm{nom}}=0.65\ \mathrm{m/s}$、缓存频率约 $200\ \mathrm{Hz}$ 时，当前十点
+轨迹的离线检查结果为：
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+指标 & 数值\\
+\midrule
+总时间 & $10.223\ \mathrm{s}$\\
+离散状态数 & $2046$\\
+实际相对位置范围 & $x\in[-1.54,1.43]$, $y\in[-1.20,1.53]$, $z\in[0,0.80]\ \mathrm m$\\
+推力加速度范围 & $9.47\sim11.06\ \mathrm{m/s^2}$\\
+最大倾角 & $17.5^\circ$\\
+最大机体角速度绝对值 & $(0.54,1.22,0.10)\ \mathrm{rad/s}$\\
+最大推力变化率 & $5.12\ \mathrm{m/s^3}$\\
+最大机体角加速度绝对值 & $(7.86,17.02,0.77)\ \mathrm{rad/s^2}$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{算法边界}
+
+当前生成器需要注意以下边界：
+\begin{enumerate}[leftmargin=2.4em]
+  \item 段时间由式~\eqref{eq:time-allocation}预先给定，并非最短时间优化结果；
+  \item QP 只有等式约束，没有直接限制倾角、推力、角速度及它们的变化率；
+  \item 航点之间没有障碍物或安全走廊约束，多项式也可能在节点之间产生几何超调；
+  \item 起点采用零速度边界，进入 CMD 前应尽量处于稳定悬停；
+  \item 固定偏航适合当前验证轨迹，若需沿速度方向转头，应把偏航及其导数作为额外轨迹；
+  \item 真机执行前仍应检查离线峰值、MPC 求解时间、底层饱和和闭环跟踪误差。
+\end{enumerate}
+
+\section{代码对应关系}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.34\textwidth}X}
+\toprule
+数学步骤 & 当前实现\\
+\midrule
+式~\eqref{eq:time-allocation}段时间分配 & \code{MinimumSnapTrajectory::generate()} 中的 \code{durations}\\
+式~\eqref{eq:physical-derivative}导数基 & \code{basisDerivative()}\\
+式~\eqref{eq:snap-hessian}Snap Hessian & \code{hessian} 组装循环\\
+式~\eqref{eq:waypoint-constraints}--\eqref{eq:boundary-derivatives} & \code{constraints/targets} 组装循环\\
+式~\eqref{eq:kkt}KKT 求解 & \code{completeOrthogonalDecomposition().solve()}\\
+式~\eqref{eq:thrust-attitude}--\eqref{eq:rotation-construction} & \code{attitudeFromForce()}\\
+式~\eqref{eq:body-rate}角速度 & \code{logSo3(current.transpose()*next)/actual_dt}\\
+轨迹一次装载 & \code{load_minimum_snap_cmd_trajectory_()}\\
+MPC 滚动采样 & \code{GptMpcControl::calculateControl()}\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{总结}
+
+当前实现的完整数据流为
+\begin{equation}
+\boxed{
+\text{十个三维航点}
+\rightarrow\text{段时间分配}
+\rightarrow\text{等式约束 minimum-snap QP}
+\rightarrow\text{七次多项式}
+\rightarrow(\bm p,\bm v,\bm R,a_T,\bm\omega)
+\rightarrow\text{离散轨迹缓存}
+\rightarrow\text{滚动时域 MPC}.}
+\end{equation}
+它解决的是固定段时间下的平滑插值问题，并通过四旋翼微分平坦关系把平动多项式转换
+为 MPC 所需的姿态、推力和角速度参考。
+
+\end{document}

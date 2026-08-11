@@ -1,0 +1,233 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<root>
+ <tabbed_widget name="Main Window" parent="main_window">
+  <Tab tab_name="tab4" containers="1">
+   <Container>
+    <DockSplitter count="3" orientation="-" sizes="0.333333;0.333333;0.333333">
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611245" bottom="-0.000001" right="737.452075" top="-0.000000"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/des_rate_x" color="#bcbd22"/>
+       <curve name="/fmu/out/sensor_combined/gyro_rad.0" color="#ff7f0e"/>
+       <curve name="/debugPx4/ctrl/ref_ome_x" color="#f14cc1"/>
+       <curve name="/debugPx4/ctrl/ref_ome_dot_x" color="#bcbd22"/>
+      </plot>
+     </DockArea>
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611245" bottom="0.000046" right="737.452075" top="0.000046"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/des_rate_y" color="#1f77b4"/>
+       <curve name="/fmu/out/sensor_combined/gyro_rad.1" color="#f14cc1"/>
+       <curve name="/debugPx4/ctrl/ref_ome_y" color="#9467bd"/>
+      </plot>
+     </DockArea>
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611245" bottom="-0.000000" right="737.452075" top="-0.000000"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/des_rate_z" color="#d62728"/>
+       <curve name="/fmu/out/sensor_combined/gyro_rad.2" color="#9467bd"/>
+       <curve name="/debugPx4/ctrl/ref_ome_z" color="#17becf"/>
+      </plot>
+     </DockArea>
+    </DockSplitter>
+   </Container>
+  </Tab>
+  <Tab tab_name="tab6" containers="1">
+   <Container>
+    <DockSplitter count="3" orientation="-" sizes="0.333333;0.333333;0.333333">
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611274" bottom="-0.000000" right="737.452084" top="0.000000"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/des_roll" color="#9467bd"/>
+       <curve name="roll" color="#1f77b4"/>
+      </plot>
+     </DockArea>
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611274" bottom="0.000000" right="737.452084" top="0.000000"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/des_pitch" color="#17becf"/>
+       <curve name="pitch" color="#d62728"/>
+      </plot>
+     </DockArea>
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611274" bottom="-0.000000" right="737.452084" top="-0.000000"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/des_yaw" color="#bcbd22"/>
+       <curve name="yaw" color="#1ac938"/>
+      </plot>
+     </DockArea>
+    </DockSplitter>
+   </Container>
+  </Tab>
+  <Tab tab_name="tab3" containers="1">
+   <Container>
+    <DockSplitter count="3" orientation="-" sizes="0.333333;0.333333;0.333333">
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611295" bottom="-0.000000" right="737.452090" top="-0.000000"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/ref_v_x" color="#ff7f0e"/>
+       <curve name="/fmu/out/vehicle_local_position/vx" color="#d62728"/>
+      </plot>
+     </DockArea>
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611295" bottom="-0.000000" right="737.452090" top="-0.000000"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/ref_v_y" color="#f14cc1"/>
+       <curve name="/fmu/out/vehicle_local_position/vy" color="#1ac938"/>
+      </plot>
+     </DockArea>
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611295" bottom="0.000000" right="737.452090" top="0.000000"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/ref_v_z" color="#9467bd"/>
+       <curve name="/fmu/out/vehicle_local_position/vz" color="#ff7f0e"/>
+      </plot>
+     </DockArea>
+    </DockSplitter>
+   </Container>
+  </Tab>
+  <Tab tab_name="tab2" containers="1">
+   <Container>
+    <DockSplitter count="3" orientation="-" sizes="0.333333;0.333333;0.333333">
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611295" bottom="0.000004" right="737.452090" top="0.000004"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/ref_p_x" color="#1f77b4"/>
+       <curve name="/fmu/out/vehicle_local_position/x" color="#17becf"/>
+      </plot>
+     </DockArea>
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611295" bottom="0.000001" right="737.452090" top="0.000001"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/ref_p_y" color="#d62728"/>
+       <curve name="/fmu/out/vehicle_local_position/y" color="#bcbd22"/>
+      </plot>
+     </DockArea>
+     <DockArea name="...">
+      <plot flip_y="false" flip_x="false" style="Lines" mode="TimeSeries">
+       <range left="728.611295" bottom="-0.100394" right="737.452090" top="0.099606"/>
+       <limitY/>
+       <curve name="/debugPx4/ctrl/ref_p_z" color="#1ac938"/>
+       <curve name="/fmu/out/vehicle_local_position/z" color="#1f77b4"/>
+      </plot>
+     </DockArea>
+    </DockSplitter>
+   </Container>
+  </Tab>
+  <currentTabIndex index="3"/>
+ </tabbed_widget>
+ <use_relative_time_offset enabled="1"/>
+ <!-- - - - - - - - - - - - - - - -->
+ <!-- - - - - - - - - - - - - - - -->
+ <Plugins>
+  <plugin ID="DataLoad CSV">
+   <default time_axis="" delimiter="0"/>
+  </plugin>
+  <plugin ID="DataLoad MCAP"/>
+  <plugin ID="DataLoad ROS2 bags">
+   <use_header_stamp value="false"/>
+   <discard_large_arrays value="true"/>
+   <max_array_size value="990"/>
+   <boolean_strings_to_number value="true"/>
+   <remove_suffix_from_strings value="true"/>
+  </plugin>
+  <plugin ID="DataLoad ULog"/>
+  <plugin ID="ROS2 Topic Subscriber">
+   <use_header_stamp value="false"/>
+   <discard_large_arrays value="true"/>
+   <max_array_size value="900"/>
+   <boolean_strings_to_number value="true"/>
+   <remove_suffix_from_strings value="false"/>
+  </plugin>
+  <plugin ID="UDP Server"/>
+  <plugin ID="WebSocket Server"/>
+  <plugin ID="ZMQ Subscriber"/>
+  <plugin ID="Fast Fourier Transform"/>
+  <plugin ID="Quaternion to RPY"/>
+  <plugin ID="Reactive Script Editor">
+   <library code="--[[ Helper function to create a series from arrays&#xa;&#xa; new_series: a series previously created with ScatterXY.new(name)&#xa; prefix:     prefix of the timeseries, before the index of the array&#xa; suffix_X:   suffix to complete the name of the series containing the X value. If [nil], use the index of the array.&#xa; suffix_Y:   suffix to complete the name of the series containing the Y value&#xa; timestamp:   usually the tracker_time variable&#xa;              &#xa; Example:&#xa; &#xa; Assuming we have multiple series in the form:&#xa; &#xa;   /trajectory/node.{X}/position/x&#xa;   /trajectory/node.{X}/position/y&#xa;   &#xa; where {N} is the index of the array (integer). We can create a reactive series from the array with:&#xa; &#xa;   new_series = ScatterXY.new(&quot;my_trajectory&quot;) &#xa;   CreateSeriesFromArray( new_series, &quot;/trajectory/node&quot;, &quot;position/x&quot;, &quot;position/y&quot;, tracker_time );&#xa;--]]&#xa;&#xa;function CreateSeriesFromArray( new_series, prefix, suffix_X, suffix_Y, timestamp )&#xa;  &#xa;  --- clear previous values&#xa;  new_series:clear()&#xa;  &#xa;  --- Append points to new_series&#xa;  index = 0&#xa;  while(true) do&#xa;&#xa;    x = index;&#xa;    -- if not nil, get the X coordinate from a series&#xa;    if suffix_X ~= nil then &#xa;      series_x = TimeseriesView.find( string.format( &quot;%s.%d/%s&quot;, prefix, index, suffix_X) )&#xa;      if series_x == nil then break end&#xa;      x = series_x:atTime(timestamp)&#x9; &#xa;    end&#xa;    &#xa;    series_y = TimeseriesView.find( string.format( &quot;%s.%d/%s&quot;, prefix, index, suffix_Y) )&#xa;    if series_y == nil then break end &#xa;    y = series_y:atTime(timestamp)&#xa;    &#xa;    new_series:push_back(x,y)&#xa;    index = index+1&#xa;  end&#xa;end&#xa;&#xa;--[[ Similar to the built-in function GetSeriesNames(), but select only the names with a give prefix. --]]&#xa;&#xa;function GetSeriesNamesByPrefix(prefix)&#xa;  -- GetSeriesNames(9 is a built-in function&#xa;  all_names = GetSeriesNames()&#xa;  filtered_names = {}&#xa;  for i, name in ipairs(all_names)  do&#xa;    -- check the prefix&#xa;    if name:find(prefix, 1, #prefix) then&#xa;      table.insert(filtered_names, name);&#xa;    end&#xa;  end&#xa;  return filtered_names&#xa;end&#xa;&#xa;--[[ Modify an existing series, applying offsets to all their X and Y values&#xa;&#xa; series: an existing timeseries, obtained with TimeseriesView.find(name)&#xa; delta_x: offset to apply to each x value&#xa; delta_y: offset to apply to each y value &#xa;  &#xa;--]]&#xa;&#xa;function ApplyOffsetInPlace(series, delta_x, delta_y)&#xa;  -- use C++ indeces, not Lua indeces&#xa;  for index=0, series:size()-1 do&#xa;    x,y = series:at(index)&#xa;    series:set(index, x + delta_x, y + delta_y)&#xa;  end&#xa;end&#xa;"/>
+   <scripts/>
+  </plugin>
+  <plugin ID="CSV Exporter"/>
+  <plugin ID="ROS2 Topic Re-Publisher"/>
+ </Plugins>
+ <!-- - - - - - - - - - - - - - - -->
+ <previouslyLoaded_Datafiles/>
+ <previouslyLoaded_Streamer name="ROS2 Topic Subscriber"/>
+ <!-- - - - - - - - - - - - - - - -->
+ <customMathEquations>
+  <snippet name="roll">
+   <global></global>
+   <function>w = value
+x = v1
+y = v2
+z = v3
+
+dcm21 = 2 * (w * x + y * z)
+dcm22 = w*w - x*x - y*y + z*z
+
+roll = math.atan(dcm21, dcm22)
+
+return roll</function>
+   <linked_source>/fmu/out/vehicle_attitude/q.0</linked_source>
+   <additional_sources>
+    <v1>/fmu/out/vehicle_attitude/q.1</v1>
+    <v2>/fmu/out/vehicle_attitude/q.2</v2>
+    <v3>/fmu/out/vehicle_attitude/q.3</v3>
+   </additional_sources>
+  </snippet>
+  <snippet name="pitch">
+   <global></global>
+   <function>w = value
+x = v1
+y = v2
+z = v3
+
+dcm20 = 2 * (x * z - w * y)
+
+pitch = math.asin(-dcm20)
+
+return pitch</function>
+   <linked_source>/fmu/out/vehicle_attitude/q.0</linked_source>
+   <additional_sources>
+    <v1>/fmu/out/vehicle_attitude/q.1</v1>
+    <v2>/fmu/out/vehicle_attitude/q.2</v2>
+    <v3>/fmu/out/vehicle_attitude/q.3</v3>
+   </additional_sources>
+  </snippet>
+  <snippet name="yaw">
+   <global></global>
+   <function>w = value
+x = v1
+y = v2
+z = v3
+
+dcm10 = 2 * (x * y + w * z)
+dcm00 = w*w + x*x - y*y - z*z
+
+yaw = math.atan(dcm10, dcm00)
+
+return yaw</function>
+   <linked_source>/fmu/out/vehicle_attitude/q.0</linked_source>
+   <additional_sources>
+    <v1>/fmu/out/vehicle_attitude/q.1</v1>
+    <v2>/fmu/out/vehicle_attitude/q.2</v2>
+    <v3>/fmu/out/vehicle_attitude/q.3</v3>
+   </additional_sources>
+  </snippet>
+ </customMathEquations>
+ <snippets/>
+ <!-- - - - - - - - - - - - - - - -->
+</root>
+

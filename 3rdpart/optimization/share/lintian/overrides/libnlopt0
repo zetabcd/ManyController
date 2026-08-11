@@ -1,0 +1,6 @@
+# To be discussed with upstream.
+#
+# For 2.4, grep exit shows, that problem is in
+# direct/direct-internal.h: ASRT macro, used in ./direct/DIRsubrout.c;
+# stogo/local.cc and stogo/tools.cc sources.
+libnlopt0: exit-in-shared-library usr/lib/*/libnlopt.so.*

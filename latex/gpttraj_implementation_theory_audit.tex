@@ -1,0 +1,792 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+\usepackage{amsmath,amssymb,bm,mathtools,booktabs,longtable,tabularx}
+\usepackage{enumitem,geometry,xcolor,hyperref}
+\geometry{left=22mm,right=22mm,top=22mm,bottom=24mm}
+\hypersetup{colorlinks=true,linkcolor=blue!55!black,urlcolor=blue!55!black}
+\setlist{nosep}
+\newcommand{\R}{\mathbb R}
+\newcommand{\SO}{\mathrm{SO}(3)}
+\newcommand{\Exp}{\operatorname{Exp}}
+\newcommand{\Log}{\operatorname{Log}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\sat}{\operatorname{sat}}
+\newcommand{\normtwo}[1]{\left\lVert#1\right\rVert_2}
+\newcommand{\normone}[1]{\left\lVert#1\right\rVert_1}
+\newcommand{\norminf}[1]{\left\lVert#1\right\rVert_\infty}
+\newcommand{\positive}[1]{\left[#1\right]_+}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{当前四旋翼轨迹优化实现的理论推导与保守性审计}
+\author{严格对应 \code{gpttraj.cpp/.h}、\code{gptmpc.cpp/.h}}
+\date{2026年8月}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{结论先行}
+
+当前实现确实允许优化器直接选择总推力加速度和机体角速度，输入边界本身也不小：
+总推力加速度上界约为 $4g$，三个机体角速度上界均为 $14\,{\rm rad/s}$。
+因此，RViz 中推力箭头接近竖直，\textbf{不能简单归因于执行器约束太紧}。
+
+本次修改后，代码已经按“控制受约束的最小时间直接配点”构造：
+\begin{enumerate}
+  \item 将总时间 $T$ 作为 SCP 决策变量，并在目标中加入 $w_TT$；
+  \item 对动力学增加关于 $T$ 的一阶导数；
+  \item 约束实际控制 $a_T,\bm\omega$ 的幅值和变化率；
+  \item 平滑代价作用于实际 $\bm u_k-\bm u_{k-1}$；
+  \item 先获得 CSTC 可行轨迹，再激活最小时间方向，并保存最短可行 incumbent；
+  \item RViz 当前画的是\textbf{总推力加速度} $a_T\bm R\bm e_3$，其中悬停时
+  也必然有约 $g$ 的竖直分量；它不是净机动加速度
+  $a_T\bm R\bm e_3-g\bm e_3$。视觉上竖直分量会非常显眼。
+\end{enumerate}
+
+当前结果应解释为给定离散化、控制边界和 SCP 初值下得到的局部最短可行 incumbent，
+不宣称非凸问题的全局最优。
+
+\section{坐标系、状态和控制输入}
+
+\subsection{坐标约定}
+
+惯性系采用 ENU，机体系采用 FLU。旋转矩阵
+$\bm R\in\SO$ 将机体系向量主动旋转到 ENU：
+\[
+ \bm v^{\rm ENU}=\bm R\bm v^{\rm body}.
+\]
+令 $\bm e_3=[0,0,1]^\mathsf T$，则机体正 $Z$ 轴在 ENU 中为
+$\bm R\bm e_3$。当前模型规定正总推力沿机体 $+Z$。
+
+\subsection{状态、优化器输入和物理量纲}
+
+轨迹优化器的状态为
+\begin{align}
+ \bm x&=(\bm p,\bm v,\bm R)
+ \in\R^3\times\R^3\times\SO,\\
+ \bm p&:\text{位置 }[\mathrm m],\qquad
+ \bm v:\text{速度 }[\mathrm{m/s}].
+\end{align}
+优化器控制输入为
+\begin{align}
+ \bm u&=\begin{bmatrix}a_T&\bm\omega^\mathsf T\end{bmatrix}^\mathsf T
+ \in\R^4,\\
+ a_T&:\text{质量归一化总推力 }[\mathrm{m/s^2}],\\
+ \bm\omega&:\text{FLU 机体系角速度 }[\mathrm{rad/s}].
+\end{align}
+这里 $a_T$ 不是牛顿制推力。真正发送给工程底层接口的总推力为
+\begin{equation}
+ F_T=m a_T.
+ \label{eq:newton-thrust}
+\end{equation}
+因此规划器不需要质量参数；质量只在控制器输出处用于式~\eqref{eq:newton-thrust}。
+
+\section{当前无人机动力学模型}
+
+\subsection{连续时间模型}
+
+代码隐含的连续模型是
+\begin{align}
+ \dot{\bm p}&=\bm v,\\
+ \dot{\bm v}&=-g\bm e_3+a_T\bm R\bm e_3,\label{eq:continuous-v}\\
+ \dot{\bm R}&=\bm R\widehat{\bm\omega}.
+ \label{eq:continuous-R}
+\end{align}
+其中帽算子满足 $\widehat{\bm a}\bm b=\bm a\times\bm b$。
+姿态更新直接以机体角速度为输入，因此没有显式建模角速度动态、刚体转动惯量、
+力矩和单电机转速。
+
+\subsection{离散模型}
+
+固定总时间 $T$ 被分成 $N$ 段，$h=T/N$。代码使用
+\begin{align}
+ \bm p_{k+1}&=\bm p_k+h\bm v_k,\label{eq:disc-p}\\
+ \bm v_{k+1}&=\bm v_k+h(-g\bm e_3+a_{T,k}\bm R_k\bm e_3),
+ \label{eq:disc-v}\\
+ \bm R_{k+1}&=\bm R_k\Exp(h\bm\omega_k).
+ \label{eq:disc-R}
+\end{align}
+位置和速度使用前向 Euler，姿态使用李群指数映射。位置式没有
+$\tfrac12h^2\bm a_k$ 项，因此它不是常加速度精确离散化。
+
+\subsection{推力方向、倾角和机动加速度}
+
+惯性系净加速度为
+\begin{equation}
+ \bm a_k^{\rm net}=a_{T,k}\bm R_k\bm e_3-g\bm e_3.
+ \label{eq:net-acc}
+\end{equation}
+定义推力轴相对惯性系竖直方向的倾角
+\begin{equation}
+ \theta_k=\cos^{-1}\!\left(\bm e_3^\mathsf T\bm R_k\bm e_3\right).
+\end{equation}
+则
+\begin{align}
+ \normtwo{\bm a_{xy,k}^{\rm net}}&=a_{T,k}\sin\theta_k,\\
+ a_{z,k}^{\rm net}&=a_{T,k}\cos\theta_k-g.
+\end{align}
+反过来，如果给定所需净加速度 $\bm a^{\rm net}$，理想推力满足
+\begin{align}
+ a_T&=\normtwo{\bm a^{\rm net}+g\bm e_3},\\
+ \bm R\bm e_3&=\frac{\bm a^{\rm net}+g\bm e_3}
+ {\normtwo{\bm a^{\rm net}+g\bm e_3}},\\
+ \theta&=\tan^{-1}\!\frac{\normtwo{\bm a_{xy}^{\rm net}}}{g+a_z^{\rm net}}.
+ \label{eq:tilt-demand}
+\end{align}
+式~\eqref{eq:tilt-demand} 直接说明：总时间越长，所需水平加速度越小，重力越
+占主导，推力方向就越接近竖直。
+
+\subsection{没有进入当前规划模型的物理因素}
+
+当前轨迹优化未包含：
+\begin{itemize}
+  \item 气动阻力、桨盘阻力、风扰动和地效；
+  \item 转动惯量、角动量、力矩及角加速度；
+  \item 电机一阶动态、转速、单电机推力和混控分配；
+  \item 电池电压、功率、能量和推力变化率；
+  \item 载荷变化以及质量变化；
+  \item 障碍物、视场和空气动力学攻角限制。
+\end{itemize}
+这是一个以 $[a_T,\bm\omega]$ 为直接输入的简化四旋翼运动学--动力学模型，
+适合对接现有推力/角速度底层，但不等于完整刚体与执行器模型。
+
+\section{边界条件与航点要求}
+
+初始和终端都硬约束全部九维状态：
+\begin{align}
+ \bm p_0&=\bm p_{\rm init},&
+ \bm v_0&=\bm v_{\rm init},&
+ \bm R_0&=\bm R_{\rm init},\\
+ \bm p_N&=\bm p_{\rm term},&
+ \bm v_N&=\bm v_{\rm term},&
+ \bm R_N&=\bm R_{\rm term}.
+\end{align}
+当前 YAML 的初末速度均为零，初末 yaw 均为零；构造边界姿态时只有 yaw，
+因此 roll 和 pitch 也为零。也就是说，轨迹必须从水平静止姿态出发，并回到水平
+静止姿态。
+
+第 $j$ 个航点由中心 $\bm p_j^w$ 和半径 $r_j$ 描述：
+\begin{equation}
+ \normtwo{\bm p_k-\bm p_j^w}\leq r_j.
+ \label{eq:waypoint-ball}
+\end{equation}
+经过节点 $k$ 不预先固定，而由 CSTC 进度变量选择。
+
+\section{名义轨迹初始化}
+
+\subsection{折线位置和候选时间}
+
+起点、航点、终点按配置顺序组成折线，总弧长为 $L$。初始候选时间为
+\begin{equation}
+ T_0=\sat_{[T_{\min},T_{\max}]}
+ \left(\frac{1.5L}{v_{\rm initGuess}}\right).
+ \label{eq:initial-time}
+\end{equation}
+位置按折线弧长等比例采样，而不是按动力学滚动生成。
+
+\subsection{速度、姿态和输入初始化}
+
+内部节点速度使用中心差分
+\begin{equation}
+ \bar{\bm v}_k=\frac{\bar{\bm p}_{k+1}-\bar{\bm p}_{k-1}}{2h},
+\end{equation}
+端点速度则被边界值覆盖。用于生成姿态的加速度近似为
+\begin{equation}
+ \bar{\bm a}_k=\frac{\bar{\bm v}_{k+1}-\bar{\bm v}_{k-1}}{2h}.
+\end{equation}
+然后令名义机体 $+Z$ 指向
+\begin{equation}
+ \bar{\bm R}_k\bm e_3\parallel \bar{\bm a}_k+g\bm e_3,
+\end{equation}
+并按初末 yaw 线性插值确定剩余航向自由度。名义输入为
+\begin{align}
+ \bar a_{T,k}&=\sat_{[a_{T,\min},a_{T,\max}]}
+ \left((\bm a_k+g\bm e_3)^\mathsf T\bar{\bm R}_k\bm e_3\right),\\
+ \bar{\bm\omega}_k&=\sat_{[-\bm\omega_{\max},\bm\omega_{\max}]}
+ \left(\frac1h\Log(\bar{\bm R}_k^\mathsf T\bar{\bm R}_{k+1})\right).
+\end{align}
+
+这个初始化决定了 SCP 的出发盆地。若 $T$ 较长，则折线差分加速度较小，
+$g\bm e_3$ 主导姿态初始化，推力箭头从第一轮起就接近竖直。
+
+\section{流形增量与动力学线性化}
+
+\subsection{局部优化坐标}
+
+第 $\ell$ 轮 SCP 的名义状态记为
+$(\bar{\bm p}_k,\bar{\bm v}_k,\bar{\bm R}_k)$。局部增量为
+\begin{equation}
+ \delta\bm x_k=
+ \begin{bmatrix}
+ \delta\bm p_k\\ \delta\bm v_k\\ \delta\bm\theta_k
+ \end{bmatrix}\in\R^9,
+\end{equation}
+更新规则是
+\begin{align}
+ \bm p_k^+&=\bar{\bm p}_k+\delta\bm p_k,\\
+ \bm v_k^+&=\bar{\bm v}_k+\delta\bm v_k,\\
+ \bm R_k^+&=\bar{\bm R}_k\Exp(\delta\bm\theta_k),\\
+ \bm u_k^+&=\bar{\bm u}_k+\delta\bm u_k.
+ \label{eq:scp-update}
+\end{align}
+姿态误差采用右扰动
+$\Log(\bar{\bm R}_k^\mathsf T\bm R_k)$，所以姿态不会被当成九个独立矩阵元素。
+
+\subsection{有限差分雅可比}
+
+令非线性一步传播为 $f_h(\bm x_k,\bm u_k)$，名义下一状态为
+$\bar{\bm x}_{k+1}$。代码在切空间定义
+\begin{equation}
+ \bm F_k(\delta\bm x_k,\delta\bm u_k)
+ =f_h(\bar{\bm x}_k\boxplus\delta\bm x_k,
+ \bar{\bm u}_k+\delta\bm u_k)\boxminus\bar{\bm x}_{k+1}.
+\end{equation}
+名义缺陷和雅可比为
+\begin{align}
+ \bm c_k&=\bm F_k(\bm0,\bm0),\\
+ \bm A_k(:,i)&\simeq
+ \frac{\bm F_k(\epsilon\bm e_i,\bm0)-\bm c_k}{\epsilon},\\
+ \bm B_k(:,i)&\simeq
+ \frac{\bm F_k(\bm0,\epsilon\bm e_i)-\bm c_k}{\epsilon},
+ \qquad \epsilon=10^{-6}.
+\end{align}
+引入九维虚拟控制 $\bm d_k$ 后，QP 动力学等式为
+\begin{equation}
+ \delta\bm x_{k+1}-\bm A_k\delta\bm x_k
+ -\bm B_k\delta\bm u_k-\bm d_k=\bm c_k.
+ \label{eq:linear-dynamics}
+\end{equation}
+虚拟控制保证早期线性化子问题较容易可行，再通过大权重将其压小。
+
+\section{QP 优化变量}
+
+设航点数为 $M$。启用严格顺序 CSTC 时，单轮 QP 决策向量为
+\begin{equation}
+ \bm z=\begin{bmatrix}
+ \delta\bm X\\
+ \delta\bm U\\
+ \bm D\\
+ \delta\bm\lambda\\
+ \delta\bm\mu\\
+ \bm s^{\rm wp}\\
+ \bm s^{\rm ord}\\
+ \delta T
+ \end{bmatrix}.
+ \label{eq:variables}
+\end{equation}
+各部分维数为
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+变量 & 维数 & 含义\\
+\midrule
+$\delta\bm X$ & $9(N+1)$ & 位置、速度、姿态切空间增量\\
+$\delta\bm U$ & $4N$ & 推力加速度与机体角速度增量\\
+$\bm D$ & $9N$ & 动力学虚拟控制\\
+$\delta\bm\lambda$ & $(N+1)M$ & 航点剩余进度增量\\
+$\delta\bm\mu$ & $NM$ & 每一步进度消耗增量\\
+$\bm s^{\rm wp}$ & $NM$ & 空间 CSTC 非负松弛\\
+$\bm s^{\rm ord}$ & $N(M-1)$ & 严格顺序 CSTC 非负松弛\\
+$\delta T$ & $1$ & 总时间增量\\
+\bottomrule
+\end{tabular}
+\end{center}
+总变量数按代码原样写为
+\begin{equation}
+ n_z=9(N+1)+4N+9N+(N+1)M+NM+NM+N(M-1)+1.
+\end{equation}
+
+\section{当前 QP 目标函数的精确含义}
+
+忽略为数值正定性加入的 $10^{-8}$ 量级项，代码实际构造
+\begin{align}
+ J_{\rm QP}={}&w_T(\bar T+\delta T)+w_{\delta T}(\delta T)^2
+ +w_x\sum_{k=0}^{N}\normtwo{\delta\bm x_k}^2\nonumber\\
+ &+w_u\sum_{k=0}^{N-1}\normtwo{
+ \bar{\bm u}_k+\delta\bm u_k-\bm u_{\rm hov}}^2\nonumber\\
+ &+w_{\Delta u}\sum_{k=1}^{N-1}
+ \normtwo{(\bar{\bm u}_k+\delta\bm u_k)-
+ (\bar{\bm u}_{k-1}+\delta\bm u_{k-1})}^2
+ +w_d\sum_{k=0}^{N-1}\normtwo{\bm d_k}^2\nonumber\\
+ &+w_\mu\sum_{j,k}(\delta\mu_k^j)^2
+ +w_s\sum_{j,k}s_{k,j}^{\rm wp}
+ +w_s\sum_{j,k}s_{k,j}^{\rm ord}.
+ \label{eq:actual-cost}
+\end{align}
+默认权重为
+\begin{equation}
+ w_T=10,\quad w_{\delta T}=20,\quad w_x=1,\quad w_u=0.05,\quad
+ w_{\Delta u}=0.2,\quad w_d=10^5,\quad w_\mu=1,\quad w_s=2\times10^5.
+\end{equation}
+
+当前代价的关键实现事实为：
+\begin{enumerate}
+  \item $w_x$ 惩罚的是本轮状态\textbf{更新量}，不是位置、速度、姿态本身，
+  也不是相对某个时间最优参考的状态误差。
+  \item $w_u$ 惩罚相对悬停输入
+  $\bm u_{\rm hov}=[g,0,0,0]^\mathsf T$ 的实际输入；
+  \item 实际输入平滑项完整展开到 Hessian 和 gradient；
+  \item 线性时间项推动缩短时间，二次 $\delta T$ 项和时间信赖域控制每轮步长。
+\end{enumerate}
+
+\section{当前施加的全部约束}
+
+\subsection{边界、动力学和信赖域}
+
+初始增量固定为零，终端增量修正到给定终端状态。每段加入
+式~\eqref{eq:linear-dynamics}。状态信赖域为逐分量盒约束
+\begin{align}
+ \norminf{\delta\bm p_k}&\leq\rho_p,& \rho_p&=1.0\,{\rm m},\\
+ \norminf{\delta\bm v_k}&\leq\rho_v,& \rho_v&=3.0\,{\rm m/s},\\
+ \norminf{\delta\bm\theta_k}&\leq\rho_R,& \rho_R&=0.7\,{\rm rad}.
+\end{align}
+注意 $\rho_R$ 是旋转向量三个分量各自的盒界，不是直接约束总倾角。
+
+\subsection{控制输入约束}
+
+输入使用绝对盒约束
+\begin{align}
+ a_{T,\min}&\leq \bar a_{T,k}+\delta a_{T,k}\leq a_{T,\max},\\
+ -\bm\omega_{\max}&\leq
+ \bar{\bm\omega}_k+\delta\bm\omega_k\leq\bm\omega_{\max}.
+\end{align}
+当前 YAML 为
+\begin{equation}
+ 0.5\leq a_T\leq39.22\,{\rm m/s^2},\qquad
+ |\omega_x|,|\omega_y|,|\omega_z|\leq14\,{\rm rad/s}.
+\end{equation}
+此外已经加入实际控制变化率硬约束
+\begin{align}
+ |a_{T,k+1}-a_{T,k}|&\leq\dot a_{T,\max}h,\\
+ |\omega_{i,k+1}-\omega_{i,k}|&\leq\alpha_{i,\max}h,
+\end{align}
+默认 $\dot a_{T,\max}=12\,{\rm m/s^3}$、
+$\alpha_{i,\max}=20\,{\rm rad/s^2}$，并对起终端输入相对悬停输入施加同类约束。
+
+\subsection{CSTC 航点进度}
+
+对每个航点引入剩余进度 $\lambda_k^j$ 和本步消耗 $\mu_k^j$：
+\begin{align}
+ \lambda_{k+1}^j&=\lambda_k^j-\mu_k^j,\\
+ \lambda_0^j&=1,qquad \lambda_N^j=0,\\
+ 0\leq\lambda_k^j&\leq1,qquad0\leq\mu_k^j\leq1.
+ \label{eq:progress}
+\end{align}
+因此 $\sum_k\mu_k^j=1$。弱顺序约束为
+\begin{equation}
+ \lambda_k^j\leq\lambda_k^{j+1}.
+\end{equation}
+令
+\begin{equation}
+ g_k^j(\bm p_k)=\normtwo{\bm p_k-\bm p_j^w}^2-r_j^2.
+\end{equation}
+空间互补条件为
+\begin{equation}
+ \mu_k^j g_k^j(\bm p_k)\leq0.
+ \label{eq:spatial-cstc}
+\end{equation}
+若 $\mu_k^j>0$，则必须进入航点球。严格顺序条件为
+\begin{equation}
+ \lambda_k^j\mu_k^{j+1}=0.
+ \label{eq:order-cstc}
+\end{equation}
+后一航点开始消耗进度时，前一航点必须已经完成。
+
+\subsection{CSTC 的 SCP 一阶展开}
+
+令 $\bar{\bm e}_k^j=\bar{\bm p}_k-\bm p_j^w$，
+$\bar g_k^j=\normtwo{\bar{\bm e}_k^j}^2-r_j^2$。空间 CSTC 被线性化为
+\begin{equation}
+ 2\bar\mu_k^j(\bar{\bm e}_k^j)^\mathsf T\delta\bm p_k
+ +\bar g_k^j\delta\mu_k^j-s_{k,j}^{\rm wp}
+ \leq-\bar\mu_k^j\bar g_k^j.
+ \label{eq:linear-space}
+\end{equation}
+严格顺序 CSTC 被线性化为
+\begin{equation}
+ \bar\mu_k^{j+1}\delta\lambda_k^j
+ +\bar\lambda_k^j\delta\mu_k^{j+1}-s_{k,j}^{\rm ord}
+ \leq-\bar\lambda_k^j\bar\mu_k^{j+1}.
+ \label{eq:linear-order}
+\end{equation}
+松弛均非负。进度增量另受
+\begin{equation}
+ |\delta\lambda_k^j|\leq0.35,qquad
+ |\delta\mu_k^j|\leq0.35
+\end{equation}
+以及更新后 $[0,1]$ 范围的共同限制。
+
+\subsection{当前没有施加的常见约束}
+
+\begin{center}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+约束 & 当前状态\\
+\midrule
+最大速度 & 未实现\\
+最大/最小倾角 & 未实现\\
+净加速度椭球 & 未实现\\
+角加速度或角速度变化率 & 已实现逐轴硬约束\\
+推力变化率 & 已实现硬约束\\
+单电机推力、转速和力矩 & 未实现\\
+障碍物与安全走廊 & 未实现\\
+路径曲率、航向或视场 & 未实现\\
+\bottomrule
+\end{tabularx}
+\end{center}
+因此“缺少机动”并不是因为代码显式限制了倾角或速度；更可能来自时间搜索、
+初始化和局部优化目标。
+
+\section{OSQP 子问题如何构造}
+
+OSQP 接收标准形式
+\begin{equation}
+ \min_{\bm z}\ \frac12\bm z^\mathsf T\bm P\bm z+\bm q^\mathsf T\bm z,
+ \qquad
+ \bm l\leq\bm A\bm z\leq\bm u.
+ \label{eq:osqp}
+\end{equation}
+构造过程为：
+\begin{enumerate}
+  \item 根据式~\eqref{eq:actual-cost} 用 Eigen Triplet 累加 Hessian
+  $\bm P$；松弛的一范数罚进入 $\bm q$。
+  \item 依次向 $\bm A$ 加入初末边界、线性化动力学、进度递推、进度端点、
+  弱顺序、空间 CSTC、严格顺序 CSTC。
+  \item 最后为每个变量加入一行单位阵，从而统一表达信赖域、输入范围、进度范围
+  和松弛非负约束。
+  \item Eigen 稀疏矩阵压缩成 CSC。$\bm P$ 只把上三角传给 OSQP。
+  \item OSQP 设置为最多 $50000$ 次迭代，绝对/相对容差均为 $5\times10^{-5}$，
+  打开 scaling termination、adaptive rho 和 polishing。
+\end{enumerate}
+
+虽然 OSQP 设置中的 \code{warm\_starting} 为真，但代码每轮都重新
+\code{osqp\_setup} 一个求解器，并没有把上一轮原始/对偶解显式传给下一轮，
+所以这个设置没有形成跨 SCP 轮次的真正 warm start。
+
+\section{完整求解流程}
+
+\subsection{联合状态、控制与时间的 SCP}
+
+\begin{enumerate}
+  \item 根据折线和当前 $T$ 初始化 $\bar{\bm X},\bar{\bm U}$。
+  \item 按弧长节点 one-hot 初始化 $\bar\mu$，由递推得到 $\bar\lambda$。
+  \item 对 $k=0,\ldots,N-1$ 有限差分计算
+  $\bm A_k,\bm B_k,\partial f/\partial h,\bm c_k$。
+  \item 按式~\eqref{eq:variables}、\eqref{eq:actual-cost} 和全部约束组装 QP。
+  \item 调用 OSQP；时间方向失败时收缩时间信赖域并重试。
+  \item 用式~\eqref{eq:scp-update} 更新状态、输入、进度变量和总时间。
+  \item 计算虚拟控制幅值、空间互补乘积、顺序乘积和松弛量。
+  \item 若更新量与全部残差低于阈值则提前结束，否则继续，最多运行配置的
+  SCP 轮数。
+\end{enumerate}
+
+\subsection{可行性 continuation 与最短可行 incumbent}
+
+前若干轮固定 $\delta T=0$，先恢复动力学与 CSTC 可行性；得到驻点后才允许
+$\delta T$ 进入时间信赖域。每次满足全部原始残差时保存当前轨迹，最终返回所有
+迭代中总时间最短的可行 incumbent。若初始候选无法产生任何可行 incumbent，才增加
+初始时间重新开始。
+
+\section{成功判据及其局限}
+
+代码报告的量为
+\begin{align}
+ r_f&=\max_k\norminf{f_h(\bm x_k,\bm u_k)\boxminus\bm x_{k+1}},\\
+ r_d&=\max_k\norminf{\bm d_k},\\
+ r_{\rm wp}&=\max_{j,k}\bar\mu_k^j
+ \positive{\normtwo{\bar{\bm p}_k-\bm p_j^w}^2-r_j^2},\\
+ r_{\rm ord}&=\max_{j,k}\bar\lambda_k^j\bar\mu_k^{j+1},\\
+ r_s&=\max(\bm s^{\rm wp},\bm s^{\rm ord}).
+\end{align}
+最终 \code{success} 要求
+\begin{equation}
+ r_f,r_d\leq5\times10^{-2},\qquad
+ r_{\rm wp},r_{\rm ord},r_s\leq10^{-4}.
+\end{equation}
+
+需要注意：
+\begin{enumerate}
+  \item 结果中的动力学缺陷字段现在存储更新后的原始非线性缺陷 $r_f$，
+  虚拟控制使用独立字段保存。
+  \item 联合最小时间模式可以在迭代上限返回最短可行 incumbent；因此成功表示约束
+  合格，不宣称最后一轮已经达到严格 KKT 驻点。
+  \item $r_{\rm wp}$ 的量纲包含 $\mu\,{\rm m^2}$，$10^{-4}$ 不是直接的
+  $10^{-4}\,{\rm m}$ 空间误差。
+\end{enumerate}
+
+\section{轨迹如何进入在线 MPC 控制器}
+
+规划结果保存 $\bm p,\bm v,\bm R,a_T,\bm\omega$。在线 MPC 对轨迹插值后，
+以同一个简化模型在参考轨迹周围构造误差系统
+\begin{equation}
+ \delta\bm x_{k+1}=\bm A_k\delta\bm x_k+\bm B_k\delta\bm u_k+\bm c_k.
+\end{equation}
+长度为 $H$ 的误差被凝聚为
+\begin{equation}
+ \delta\bm X=\bm S_x\delta\bm x_0+\bm S_u\delta\bm U+\bm c.
+\end{equation}
+在线 MPC 的唯一决策变量是
+\begin{equation}
+ \delta\bm U=
+ [\delta\bm u_0^\mathsf T,\ldots,
+ \delta\bm u_{H-1}^\mathsf T]^\mathsf T\in\R^{4H}.
+\end{equation}
+其目标为
+\begin{equation}
+ J_{\rm MPC}=\delta\bm X^\mathsf T\bar{\bm Q}\delta\bm X
+ +\delta\bm U^\mathsf T\bar{\bm R}\delta\bm U,
+\end{equation}
+默认单步状态权重为
+\begin{equation}
+ \bm Q=\diag(15000,15000,15000,40,40,40,80,80,80),
+\end{equation}
+输入修正权重为
+\begin{equation}
+ \bm R=\diag(0.5,0.6,0.6,0.6).
+\end{equation}
+在线 MPC 只对
+$\bm u^{\rm ref}+\delta\bm u$ 加推力和角速度盒约束。第一步命令为
+\begin{align}
+ a_T^{\rm cmd}&=a_T^{\rm ref}+\delta a_{T,0},\\
+ \bm\omega^{\rm cmd}&=\bm\omega^{\rm ref}+\delta\bm\omega_0,\\
+ F_T^{\rm cmd}&=m a_T^{\rm cmd}.
+\end{align}
+因此规划器与控制器的底层输入契约是一致的。规划轨迹若保守，在线 MPC 通常会
+高权重跟踪这个保守参考，而不会主动把它改成更激进的轨迹。
+
+\section{为何当前结果会显得保守}
+
+\subsection{视觉量本身包含重力支撑}
+
+当前箭头终点为
+\begin{equation}
+ \bm p_k+s_Ta_{T,k}\bm R_k\bm e_3.
+\end{equation}
+即使完美悬停，箭头也是长度 $s_Tg$ 的竖直向上箭头。判断机动性更有意义的量是：
+\begin{align}
+ \bm a_k^{\rm net}&=a_{T,k}\bm R_k\bm e_3-g\bm e_3,\\
+ \theta_k&=\cos^{-1}(\bm e_3^\mathsf T\bm R_k\bm e_3),\\
+ a_{xy,k}&=a_{T,k}\sin\theta_k.
+\end{align}
+所以应同时画“总推力箭头”和“净加速度箭头”，并显示最大倾角，而不能只凭总
+推力箭头的竖直分量判断。
+
+\subsection{总时间过长会从物理上直接减小倾角}
+
+对相似路径，特征加速度大致按 $1/T^2$ 缩放。若外层搜索把轨迹时间从
+$4\,{\rm s}$ 抬到 $7.5\,{\rm s}$，同类机动加速度可能下降到原来的
+$(4/7.5)^2\approx0.28$。根据式~\eqref{eq:tilt-demand}，倾角也会显著减小。
+
+\subsection{目标函数把解吸附在名义轨迹附近}
+
+折线初始化和 $w_x\normtwo{\delta\bm X}^2$、
+$w_u\normtwo{\bm U-\bm U_{\rm hov}}^2$ 仍会与最短时间项形成折中，但现在
+$w_TT$ 直接推动缩短时间，实际输入差分项推动控制连续。
+
+\subsection{短时间数值失败被解释成动力学不可行}
+
+时间变化时没有 continuation warm start；空间/顺序松弛又使用
+$2\times10^5$ 的大线性罚，进度单轮最多移动 $0.35$。短时间问题更非线性，
+更需要良好初值和多轮 continuation。当前机制可能在真实执行器上限远未饱和时，
+就因为 SCP/CSTC 未收敛而回退到更长时间。
+
+\subsection{配置文件中的关键权重}
+
+当前可视化节点已经从 YAML 读取：
+\begin{itemize}
+  \item $w_x$（\code{state\_regularization}）；
+  \item $w_u$（\code{input\_regularization}）；
+  \item $w_{\Delta u}$（\code{input\_smoothness}）；
+  \item $w_d$（\code{virtual\_control\_weight}）；
+  \item $w_\mu$（\code{progress\_regularization}）；
+  \item 状态收敛阈值和动力学阈值；
+  \item 时间权重、时间正则和时间信赖域；
+  \item 推力变化率和角速度变化率上界。
+\end{itemize}
+
+\section{建议先增加的诊断量}
+
+在改变算法前，建议每个时间尝试输出：
+\begin{enumerate}
+  \item $T$、$h$、SCP 轮数及失败原因；
+  \item $\max\normtwo{f_h(\bm x_k,\bm u_k)\boxminus\bm x_{k+1}}$，即更新后的
+  原始非线性动力学缺陷；
+  \item 最大状态/输入/进度更新量；
+  \item 最大速度、最大推力、最小推力、最大角速度；
+  \item 最大倾角 $\max\theta_k$、最大水平净加速度和最大净加速度；
+  \item 推力与角速度触碰上下界的节点比例；
+  \item 式~\eqref{eq:actual-cost} 每一项的独立数值；
+  \item CSTC 空间残差、顺序残差、松弛和 $\mu$ 的分布。
+\end{enumerate}
+若短时间失败时推力、角速度和倾角都远离合理极限，却是 CSTC 或虚拟控制残差不收敛，
+就可以确认问题主要是数值算法，而不是无人机能力不足。
+
+\section{折线拐角与真机可跟踪性}
+
+\subsection{当前哪些量连续，哪些量可以快速跳变}
+
+离散动力学要求相邻节点的位置、速度和姿态满足
+式~\eqref{eq:disc-p}--\eqref{eq:disc-R}，所以优化变量中的速度和姿态不能在同一
+离散节点数学意义上任意瞬移。当前已经限制
+\begin{align}
+ |a_{T,k+1}-a_{T,k}|&\leq \dot a_{T,\max}h,\\
+ \normtwo{\bm\omega_{k+1}-\bm\omega_k}&\leq\alpha_{\max}h,
+\end{align}
+所以推力幅值和角速度不能在相邻节点任意跳变；当前没有单独增加净加速度 jerk
+变量，因为输入变化率已经作为直接控制约束进入 QP。
+
+以当前结果 $T=7.551\,{\rm s}$、$N=60$ 为例，
+\begin{equation}
+ h=\frac{T}{N}\simeq0.126\,{\rm s}.
+\end{equation}
+每轴角速度上限为 $14\,{\rm rad/s}$，单轴一个区间允许的旋转量达到
+\begin{equation}
+ 14h\simeq1.76\,{\rm rad}\simeq101^\circ.
+\end{equation}
+这对多数常规四旋翼轨迹已经非常激进。$0.7\,{\rm rad}$ 的
+\code{attitude\_trust\_region} 只是单轮 SCP 更新范围，不是物理倾角或相邻节点
+转角约束。
+
+\subsection{为什么航点之间自然形成直线段}
+
+航点约束只要求某个节点进入位置球
+\begin{equation}
+ \normtwo{\bm p_k-\bm p_j^w}\leq r_j.
+\end{equation}
+它没有规定到达航点时的速度方向、加速度方向、切线或曲率。初始化又直接沿
+“起点--航点--终点”折线按弧长采样，而 QP 目标惩罚偏离该初值的增量。因此局部
+优化器最容易得到的解就是保留长直线段，只在航点附近用少量节点完成速度和姿态
+方向变化。
+
+若只给一组位置点，欧氏距离最短的连接本来就是折线。要得到大弧线，必须至少有
+以下一种机制：
+\begin{itemize}
+  \item 对实际净加速度变化或 jerk 施加强惩罚/硬边界；
+  \item 对角加速度、推力变化率施加边界；
+  \item 对曲率或最小转弯半径施加边界；
+  \item 为航点给定期望切线方向或切线锥；
+  \item 使用 minimum-snap、B-spline 或 Bézier 曲线生成光滑初值；
+  \item 增大航点容差，使优化器能在容差球内切弯，而不必瞄准很小的尖角区域。
+\end{itemize}
+
+\subsection{当前插值还会引入节点间不一致}
+
+在线控制器采样轨迹时，位置、速度、推力和角速度分别做线性插值，姿态做 SLERP。
+这样通常不能同时严格满足
+\begin{equation}
+ \dot{\bm p}=\bm v,qquad
+ \dot{\bm v}=-g\bm e_3+a_T\bm R\bm e_3,qquad
+ \dot{\bm R}=\bm R\widehat{\bm\omega}
+\end{equation}
+的连续时间关系。也就是说，即使离散节点满足简化动力学，插值后的高频参考仍可能
+不是一条严格动力学一致的连续轨迹。节点越稀、输入变化越快，这个问题越明显。
+
+\subsection{“求解成功”不等于“真机可跟踪”}
+
+当前成功结果只能说明：在数值容差内，它对简化离散模型、推力盒约束、角速度盒
+约束和航点 CSTC 是可接受的。它没有证明：
+\begin{itemize}
+  \item 电机能以要求的速度改变总推力；
+  \item 姿态内环能产生要求的角加速度和力矩；
+  \item 连续插值参考满足真实动力学；
+  \item 在线 MPC 在模型误差、时延和扰动下仍有足够跟踪裕量。
+\end{itemize}
+因此当前这种尖角轨迹不建议直接用于真机高速飞行。至少应先通过更完整的闭环仿真，
+检查位置误差、姿态误差、推力/角速度饱和、推力变化率和角加速度。
+
+\subsection{形成大弧线的推荐数学形式}
+
+对当前直接配点框架，建议将实际输入平滑与净加速度变化写成
+\begin{align}
+ J_{\rm smooth}={}&w_a\sum_k(a_{T,k+1}-a_{T,k})^2
+ +w_\omega\sum_k\normtwo{\bm\omega_{k+1}-\bm\omega_k}^2\nonumber\\
+ &+w_j\sum_k\normtwo{
+ \bm a_{k+1}^{\rm net}-\bm a_k^{\rm net}}^2,
+\end{align}
+并加入硬边界
+\begin{align}
+ |a_{T,k+1}-a_{T,k}|&\leq\dot a_{T,\max}h,\\
+ \norminf{\bm\omega_{k+1}-\bm\omega_k}&\leq\bm\alpha_{\max}h,\\
+ \normtwo{\bm a_{k+1}^{\rm net}-\bm a_k^{\rm net}}&\leq j_{\max}h.
+\end{align}
+这些约束会迫使无人机在到达航点之前逐渐建立横向加速度，经过航点后再逐渐退出，
+空间轨迹因而表现为较大的连续弧线，而不是到点附近才快速改变方向。
+
+如果更重视几何光滑和高阶连续性，可以直接用分段多项式或 B-spline 参数化
+$\bm p(t)$ 和 yaw，并最小化
+\begin{equation}
+ \int_0^T\normtwo{\bm p^{(4)}(t)}^2\,dt
+\end{equation}
+（minimum snap），再由微分平坦性恢复 $\bm R,a_T,\bm\omega$，最后对恢复出的
+推力、倾角和角速度施加约束。这比以折线为初值更容易得到符合直觉的大弧线。
+
+\section{建议的改进顺序与数学方向}
+
+\subsection{第一步：修正评价和验收，不改变问题本身}
+
+\begin{enumerate}
+  \item RViz 同时显示总推力、净加速度、速度和倾角。
+  \item 更新后重新计算原始非线性动力学缺陷。
+  \item 最终成功条件加入 SCP 驻点更新量。
+  \item 记录每个外层时间尝试的约束裕量和失败类别。
+\end{enumerate}
+
+\subsection{第二步：改善 continuation 和 warm start}
+
+将时间从 $T_a$ 改到 $T_b$ 时，把上一条解按归一化时间
+$\tau=t/T\in[0,1]$ 重采样：
+\begin{equation}
+ (\bm X_b^{(0)},\bm U_b^{(0)},\bm\lambda_b^{(0)},\bm\mu_b^{(0)})
+ =\mathcal R_{T_a\rightarrow T_b}(\bm X_a,\bm U_a,\bm\lambda_a,\bm\mu_a).
+\end{equation}
+同时复用上一轮 OSQP 原始和对偶解。对 CSTC 可先用较低松弛权重求可行解，再逐步
+提高 $w_s$，比一开始固定 $2\times10^5$ 更稳健。
+
+\subsection{第三步：把目标改成物理上有意义的形式}
+
+固定时间子问题可以使用实际输入平滑与机动正则，例如
+\begin{align}
+ J_T={}&w_\omega\sum_k\normtwo{\bm\omega_k}^2
+ +w_{\Delta T}\sum_k(a_{T,k+1}-a_{T,k})^2\nonumber\\
+ &+w_{\Delta\omega}\sum_k
+ \normtwo{\bm\omega_{k+1}-\bm\omega_k}^2
+ +w_d\sum_k\normone{\bm d_k}+J_{\rm CSTC}.
+\end{align}
+SCP 中必须把 $\bm u=\bar{\bm u}+\delta\bm u$ 完整展开，因此 Hessian 和 gradient
+都要包含名义输入项，而不是只写增量的二次项。
+
+如果目标是真正发挥机动性，核心仍然是最短时间：
+\begin{equation}
+ \min_{T,\bm X,\bm U,\bm\lambda,\bm\mu}
+ w_TT+J_T
+\end{equation}
+并受非线性动力学和真实执行器约束。可以继续使用外层时间搜索，但要有可靠的可行性
+oracle；也可以引入时间伸缩变量并在 SCP 中联合线性化。
+
+\subsection{第四步：补充真实安全边界}
+
+提高机动性不能只放宽数值条件。建议显式加入
+\begin{align}
+ \normtwo{\bm v_k}&\leq v_{\max},\\
+ \bm e_3^\mathsf T\bm R_k\bm e_3&\geq\cos\theta_{\max},\\
+ |a_{T,k+1}-a_{T,k}|&\leq\dot a_{T,\max}h,\\
+ \normtwo{\bm\omega_{k+1}-\bm\omega_k}&\leq\dot\omega_{\max}h,
+\end{align}
+并最终结合单电机可实现域。这样得到的是“在明确安全边界内尽量快”，而不是通过
+取消必要约束制造表面上的激进轨迹。
+
+\section{最终判断}
+
+\begin{enumerate}
+  \item 当前无人机模型允许通过倾斜 $\bm R\bm e_3$ 产生水平加速度，输入结构没有
+  从模型层面禁止机动。
+  \item 当前结果接近竖直首先要区分“总推力包含重力”造成的视觉效果和真实净加速度。
+  \item $7.551\,{\rm s}$ 的长时间会直接降低所需倾角；这个时间很可能同时受
+  SCP/CSTC 数值可行性影响。
+  \item 当前 QP 已包含时间惩罚、实际输入正则和实际输入平滑完整展开。
+  \item 在声称轨迹物理上保守之前，应先加入原始非线性缺陷、倾角、净加速度、
+  饱和裕量和逐项代价诊断。
+  \item 若诊断确认短时间下执行器仍有大量裕量，应优先修复 warm start、continuation、
+  成功判据和实际代价构造，再调整输入边界。
+\end{enumerate}
+
+\end{document}
